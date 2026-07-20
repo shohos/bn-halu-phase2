@@ -23,8 +23,10 @@ and every model stage is individually fault-tolerant, so a valid file always exi
   We deliberately depend on neither `bitsandbytes` (absent from the image) nor `peft`
   (its 0.19 torchao version check raises on load); the LoRA adapter is merged into the
   base weights with a plain `W += (α/r)·BA` matmul in `inference_lib.merge_lora_`.
-- Runtime: see `FORM_ANSWERS.md`; the notebook prints measured and projected runtimes
-  for 2,500 and 5,000 rows against the 9 h limit.
+- Runtime: **41.5 min measured** for the 2,516-row Phase 1 test file on 2×T4 with
+  internet off; the organizers' ~5,000-row fold projects to **1.37 h** against the 9 h
+  limit. The judge dominates (fp16 7B split pipeline-parallel across two T4s). The
+  notebook prints both measured and projected figures in its output.
 
 ## Pipeline
 
@@ -99,7 +101,8 @@ the judge. Measured F1₀ on them (`eval_stack.py`, `eval_stack2.py`):
 | + QLoRA 1 epoch @ lr 4e-5 (**shipped**) | 0.711 | 0.747 | 0.704 |
 | Feature stack, trained on 1,608 | 0.716 | 0.784 | 0.690 |
 | Feature stack, trained on 1,907 (CV-honest) | 0.730 | 0.832 | 0.690 |
-| **Blend, per-side weights (shipped)** | **0.737** | 0.832 | 0.698 |
+| Blend, per-side weights (local CV) | 0.737 | 0.832 | 0.698 |
+| **Blend as calibrated in-kernel (shipped)** | **0.732** | 0.816 | 0.698 |
 
 Two findings drive the design. First, the zero-shot base model already scores 0.686 on
 closed-book rows, and aggressive fine-tuning drops it to 0.564 — so we select the
@@ -107,7 +110,13 @@ checkpoint by per-epoch holdout evaluation (epoch 1 wins; epochs 2-3 degrade
 monotonically). Second, the stack dominates open-book rows while the judge is better on
 closed-book rows, so blend weights are fitted per evidence regime rather than globally.
 
+The last two rows differ because the in-kernel calibration model trains only on the
+1,608 pseudo-labeled rows, keeping its predictions on the 299 honest, whereas the local
+CV figure cross-validates a model trained on all 1,907. The shipped number is 0.732.
+
 ## Reproducing our Phase 1 predictions
 
 Run the notebook against the Phase 1 `test set.csv`: output equals our Phase 1
-submission on 2,516/2,516 rows.
+submission on 2,516/2,516 rows. With the reproduction cache disabled, the distilled
+system alone agrees with our Phase 1 submission on **79.6%** of rows — the residual
+gap is the frontier-LLM and manual-verification layer that cannot run offline.

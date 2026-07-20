@@ -5,3 +5,7 @@ dryrun_out/
 out/
 upload_*/
 *.zip
+
+# internal working docs - not for publication
+AUDIT_PROMPT.md
+FORM_ANSWERS.md
