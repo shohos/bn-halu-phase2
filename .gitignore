@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data/
+dryrun_out/
+out/
+upload_*/
+*.zip
