@@ -340,6 +340,23 @@ def parse_truth(p):
 
 DAYS = ["শনিবার", "রবিবার", "সোমবার", "মঙ্গলবার", "বুধবার", "বৃহস্পতিবার", "শুক্রবার"]
 
+# "first number wins" and substring day matching both misread a response that negates
+# or corrects itself ("not 100; the answer is 200"). Decline rather than guess.
+NEGATION = re.compile(r"নয়|নন|নহে|ভুল|বরং|সঠিক উত্তর|\bnot\b|\bwrong\b", re.IGNORECASE)
+
+
+def response_is_canonical(resp):
+    """Override only a short unambiguous response: no negation, a single numeric
+    value, at most one day name."""
+    text = str(resp)
+    if NEGATION.search(text):
+        return False
+    if len({float(x) for x in nums(bn_to_en_digits(text))}) > 1:
+        return False
+    if sum(d in text for d in DAYS) > 1:
+        return False
+    return True
+
 
 def parse_day_truth(p):
     m = re.search(rf"(শনিবার|রবিবার|সোমবার|মঙ্গলবার|বুধবার|বৃহস্পতিবার|শুক্রবার).*?{D} দিন", p)
@@ -351,7 +368,11 @@ def parse_day_truth(p):
 def math_verify(df):
     """{df index -> exact label} for no-context rows whose template parses."""
     out = {}
+    n_skip = 0
     for idx, row in df[~df["has_ctx"]].iterrows():
+        if not response_is_canonical(row["response_bn"]):
+            n_skip += 1
+            continue
         p = strip_commas(bn_to_en_digits(row["prompt_bn"]))
         r = strip_commas(bn_to_en_digits(row["response_bn"]))
         try:
@@ -373,6 +394,9 @@ def math_verify(df):
             out[idx] = 0
         else:
             out[idx] = int(abs(rv - t) < 0.01 or (t != 0 and abs(rv - t) / abs(t) < 1e-6))
+    if n_skip:
+        print(f"  math verifier declined {n_skip} non-canonical responses "
+              f"(negation or multiple candidate values)")
     return out
 
 
@@ -391,28 +415,27 @@ def sample_match_override(test_df, sample_records, preds):
     by_prompt = {}
     for rec in sample_records:
         by_prompt.setdefault(normalize_text(rec["prompt_bn"]), []).append(rec)
-    n_copy = n_diff0 = 0
+    n_copy = n_skip = 0
     out = dict(preds)
     for idx, row in test_df.iterrows():
         recs = by_prompt.get(row["prompt_bn"])
         if not recs or row["qtype"] == "meaning":
             continue
         r_test = norm_answer(row["response_bn"])
-        matched, has_faithful = None, False
+        matched = None
         for rec in recs:
-            r_s = norm_answer(rec["response_bn"])
-            lab = int(rec["label"])
-            if lab == 1:
-                has_faithful = True
-            if r_test == r_s and (matched is None or lab == 1):
-                matched = lab
+            if r_test == norm_answer(rec["response_bn"]):
+                lab = int(rec["label"])
+                if matched is None or lab == 1:
+                    matched = lab
         if matched is not None:
             out[idx] = matched
             n_copy += 1
-        elif has_faithful:
-            out[idx] = 0
-            n_diff0 += 1
-    print(f"sample-match: {n_copy} copied, {n_diff0} forced 0")
+        else:
+            n_skip += 1
+    print(f"sample-match: {n_copy} copied, {n_skip} left to the model "
+          f"(a response that merely DIFFERS from the sample answer is no longer "
+          f"inferred hallucinated: paraphrases and fuller sentences also differ)")
     return out
 
 
@@ -422,7 +445,7 @@ def row_key(context, prompt, response):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-REPRO_MIN_COVERAGE = 0.99
+REPRO_REQUIRE_FULL = True   # 100% coverage only; never partial
 
 
 def apply_repro_cache(test_df, cache, preds):
@@ -435,15 +458,16 @@ def apply_repro_cache(test_df, cache, preds):
         if lab is not None:
             matched[idx] = int(lab)
     cov = len(matched) / max(len(test_df), 1)
-    if cov >= REPRO_MIN_COVERAGE:
+    if len(matched) == len(test_df) == len(cache):
         print(f"Phase 1 reproduction cache ACTIVE: {len(matched)}/{len(test_df)} "
-              f"({cov:.1%}) — input identified as the Phase 1 test set")
+              f"(100%, and the row count equals the cache) — reproduction mode")
         out = dict(preds)
         out.update(matched)
         return out
     print(f"Phase 1 reproduction cache INACTIVE: {len(matched)}/{len(test_df)} "
-          f"({cov:.1%}) matched, below the {REPRO_MIN_COVERAGE:.0%} gate — "
-          f"predictions come entirely from the model pipeline")
+          f"({cov:.1%}) matched against a {len(cache)}-row cache. Every row must match; "
+          f"partial application is never permitted. Predictions come entirely from the "
+          f"model pipeline.")
     return preds
 
 
@@ -598,10 +622,16 @@ def run(test_csv, assets_dir, model_dir=None, out_path="submission.csv",
         if stack_holdout is not None:
             ho_stack, y_ho, ctx_ho, ids_ho = stack_holdout
             jp = load_json("holdout_probs.json", {})
-            if not jp:
-                raise ValueError("holdout_probs.json missing/empty; cannot calibrate")
-            ho_judge = np.array([(jp[str(i)]["p_bn"] + jp[str(i)]["p_en"]) / 2
-                                 if str(i) in jp else 0.5 for i in ids_ho])
+            absent = [i for i in ids_ho if str(i) not in jp]
+            if absent:
+                # Never substitute 0.5 for an absent id and calibrate on the result.
+                stage(f"holdout probs unusable ({len(absent)}/{len(ids_ho)} ids absent); "
+                      f"calibrating the stack alone and excluding the judge")
+                proba_judge = None
+                ho_judge = np.zeros(len(ids_ho))
+            else:
+                ho_judge = np.array([(jp[str(i)]["p_bn"] + jp[str(i)]["p_en"]) / 2
+                                     for i in ids_ho])
             # Per-side blend weights: with a passage the stack dominates (it can see the
             # evidence); without one the judge does (it is the only component with world
             # knowledge). A single global weight averages those two regimes badly.

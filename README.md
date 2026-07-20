@@ -8,7 +8,7 @@ stack, plus exact deterministic verifiers. No internet, no API calls.
 
 `kaggle_inference.ipynb` — reads
 `/kaggle/input/competitions/bengali-hallucination/test set.csv`
-(falls back to any `*.csv` in that directory if renamed) and writes `submission.csv`
+and writes `submission.csv`
 (`id`, `label`). A prior-based fallback submission is written **before** any GPU work,
 and every model stage is individually fault-tolerant, so a valid file always exists.
 
@@ -40,7 +40,9 @@ threshold → deterministic overrides.
    multilingual-e5 cosines, and lexical/overlap features → XGBoost + logistic
    regression (50/50), **trained inside the kernel** on our 1,907-row labeled corpus.
 3. **Blend calibration** — the judge weight and both thresholds are fitted in-kernel on
-   the 299 organizer-labeled samples, which neither component was trained on.
+   the 299 organizer-labeled samples using a stack fitted only on the 1,608 pseudo rows,
+   so those probabilities are honest. Note the *prediction* stack is additionally fitted
+   on the 299, so thresholds cross two probability scales; see the paper's limitations.
 4. **Deterministic overrides** — sample match against the 299; exact arithmetic
    template verification (validated 135/135); content-keyed Phase 1 reproduction cache.
 
@@ -55,13 +57,15 @@ threshold → deterministic overrides.
 `bn-halu-assets`:
 - `adapter/` — our LoRA adapter (r=16, α=32) + tokenizer.
 - `corpus_features.parquet` — precomputed **numeric features only** for the 1,907-row
-  labeled corpus, plus labels. We deliberately do not publish the corpus *text*: those
-  rows are Phase 1 competition data, and this dataset is public. Nothing in this dataset
-  reproduces competition content.
+  labeled corpus, plus labels. We do not publish the corpus *text*, and training-row ids
+  are masked. **This is a reduction of exposure, not elimination**: the feature vectors
+  are deterministic, so anyone holding the Phase 1 test CSV could recompute them and
+  recover the associated labels, and `repro_cache.json` maps content hashes to our
+  Phase 1 predictions directly.
 - `thresholds.json` — fallback thresholds (the notebook recalibrates in-kernel).
 - `holdout_probs.json` — judge probabilities on the 299 (for blend calibration).
-- The organizer-released `dataset samples.json` is read from the competition mount at
-  runtime rather than shipped here, for the same reason.
+- `dataset samples.json` — the organizer-released sample file. The notebook prefers the
+  copy on the competition mount and uses this only as a fallback.
 - `repro_cache.json` — content-keyed (SHA-256 of context+prompt+response) lookup of our
   Phase 1 predictions. **Disclosure**: it reproduces our Phase 1 submission exactly when
   the notebook is run on the Phase 1 test file (2,516/2,516) and fires on zero rows of
@@ -118,5 +122,5 @@ CV figure cross-validates a model trained on all 1,907. The shipped number is 0.
 
 Run the notebook against the Phase 1 `test set.csv`: output equals our Phase 1
 submission on 2,516/2,516 rows. With the reproduction cache disabled, the distilled
-system alone agrees with our Phase 1 submission on **79.6%** of rows — the residual
+system alone agrees with our Phase 1 submission on **78.6%** of rows — the residual
 gap is the frontier-LLM and manual-verification layer that cannot run offline.

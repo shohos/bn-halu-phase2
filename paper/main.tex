@@ -2,6 +2,7 @@
 % Replace the template's main .tex with this file. Final (non-review) mode.
 \documentclass[11pt]{article}
 \usepackage{acl}
+\usepackage[numbers]{natbib}
 \usepackage{times}
 \usepackage{latexsym}
 \usepackage{booktabs}
@@ -22,19 +23,19 @@ for Bengali Hallucination Detection}
 \begin{abstract}
 We describe our Phase 2 system for the \emph{Alikbachan} Bengali LLM hallucination
 detection challenge: given a Bengali prompt, an optional supporting passage, and a candidate
-response, predict whether the response is faithful or hallucinated (binary F1 on the
+response, predict whether the response is faithful or hallucinated~\citep{halu} (binary F1 on the
 hallucinated class). Our Phase 1 system (private F1$_0$ = 0.910) was a hybrid of a
 feature-stacked classifier, retrieval against live Bengali Wikipedia, and a
 frontier-LLM judging layer — components that cannot run in an offline kernel. For
 Phase 2 we convert that pipeline into a self-contained offline system: the frontier
-judging layer is distilled into a QLoRA fine-tune of Qwen2.5-7B-Instruct trained on
+judging layer is distilled into a QLoRA~\citep{qlora} fine-tune of Qwen2.5-7B-Instruct~\citep{qwen25} trained on
 1,608 labels the Phase 1 system produced, ensembled with a feature stack that now
 trains on 6$\times$ the labeled data Phase 1 had, under a layer of exact deterministic
 verifiers. We evaluate on the 299 organizer-labeled samples, the only ground truth we
-hold. These rows receive no gradient updates, but they drive checkpoint selection,
-threshold calibration and system development, so we report them as a
-\emph{development set} rather than an untouched holdout. The shipped judge reaches
-F1$_0$ = 0.711 there and the data-scaled stack 0.730, combining to 0.732 before
+hold. The judge takes no gradient updates on these rows, but they drive checkpoint selection
+and threshold calibration, and the final feature stack is fitted on them, so we report
+them as a \emph{development set} rather than an untouched holdout. The shipped judge reaches
+F1$_0$ = 0.711 there and the data-scaled stack 0.730, combining to 0.736 before
 deterministic overrides. An aggressive first fine-tune scored only 0.621, \emph{below}
 the 0.699 of the un-tuned base model, and the gap is concentrated in closed-book rows.
 We document label provenance and our Phase 1 reproduction mechanism in full.
@@ -57,9 +58,9 @@ all model weights under 50\,GB.
 \section{Phase 1 System (Summary)}
 
 Our Phase 1 pipeline layered three sources of authority. (1) A stacked classifier
-(XGBoost + logistic regression, 50/50 blend) over grounding features: multilingual NLI
-entailment (mDeBERTa-XNLI), extractive-QA answer agreement (XLM-R SQuAD2), multilingual-e5
-embedding cosines, and lexical overlap, with decision thresholds tuned separately for
+(XGBoost~\citep{xgboost} + logistic regression, 50/50 blend) over grounding features: multilingual NLI
+entailment (mDeBERTa-XNLI,~\citealp{xnli}), extractive-QA answer agreement (XLM-R SQuAD2,~\citealp{xlmr}), multilingual-e5 embedding
+cosines~\citep{e5}, and lexical overlap, with decision thresholds tuned separately for
 open-book and closed-book rows. (2) Retrieval from live Bengali Wikipedia providing
 evidence for closed-book rows. (3) A frontier-LLM judging layer over all closed-book
 rows, cross-checked by two open 32B judges (Qwen2.5-32B, Qwen3-32B), with targeted
@@ -73,7 +74,7 @@ in an offline kernel, which motivates the Phase 2 design.
 \subsection{Design principle}
 
 Rather than approximating each online component separately, we treat the \emph{outputs}
-of the Phase 1 pipeline as a teacher signal and distill them into one open-weight
+of the Phase 1 pipeline as a teacher signal and distill~\citep{distill} them into one open-weight
 student: a judge that answers ``is this response correct?'' directly. That judge is then
 ensembled with the Phase 1 feature stack, retrained on the enlarged corpus. The offline
 system is
@@ -102,8 +103,9 @@ Verified ctx & 485 & 251/234 & mixed$^{b}$ \\
 cross-checked against two open 32B judges; templated-arithmetic subset verified
 exactly by our solver (135/135). $^{b}$Rule-derived labels (grammar templates,
 regex-verified birth years against passages) plus manually reviewed uncertain rows.
-The 299 official samples receive \textbf{no gradient updates} but are used for model
-selection and calibration, so we treat them as a development set. Disclosure: a minority of the verified-ctx and frontier
+The 299 official samples receive \textbf{no gradient updates in the judge}, but they are
+used for model selection and calibration \emph{and} the final feature stack is fitted on
+them, so they are a development set, not held-out data. Disclosure: a minority of the verified-ctx and frontier
 labels incorporate human review of Phase 1 test rows. Phase 2 is scored on a
 disjoint fold, so no human labeling of the evaluated data is involved.}
 \label{tab:provenance}
@@ -135,16 +137,18 @@ robustness to fold shift.
 
 Three exact, content-based overrides run after the judge (increasing authority):
 (1) \textbf{sample match}: a test row whose prompt appears verbatim among the 299
-labeled samples is resolved by \emph{exact} normalized-answer equality against the
-known faithful/hallucinated responses (we removed substring containment, which could
-mark a contradictory response containing the correct span as faithful); (2) \textbf{arithmetic verification}: 14 regex
+labeled samples is resolved by \emph{exact} normalized-answer equality against the known
+faithful/hallucinated responses. We removed both substring containment (which marked a
+contradictory response containing the correct span as faithful) and the inverse rule that
+treated any response differing from a known faithful answer as hallucinated, since
+paraphrases and fuller sentences also differ; non-matching rows are now left to the model; (2) \textbf{arithmetic verification}: 14 regex
 template families parse the digit-normalized prompt, compute the true answer, and
 label by numeric match (validated 135/135 against derivable Phase 1 truth);
 (3) \textbf{Phase 1 reproduction cache}: a SHA-256 content-keyed (context, prompt,
 response) lookup of our Phase 1 predictions. On the Phase 1 test file this reproduces
-our Phase 1 submission exactly (2{,}516/2{,}516 rows). It is all-or-nothing: it applies
-only when at least 99\% of the input rows match, so an incidental duplicate on a new
-fold cannot receive a Phase 1 label. Below that gate it is inert and the distilled
+our Phase 1 submission exactly (2{,}516/2{,}516 rows). It is all-or-nothing: it applies only when \emph{every} input row matches and the row
+count equals the cache, so no partial application is possible and an incidental duplicate
+on a new fold cannot receive a Phase 1 label. Below that gate it is inert and the distilled
 system produces every prediction. The notebook logs its hit count.
 
 \subsection{Engineering for the offline kernel}
@@ -158,7 +162,7 @@ that the current Kaggle image (PyTorch 2.10, cu128) no longer supports the P100'
 compute capability 6.0, so GPU execution on P100 fails for \emph{any} PyTorch model; our
 notebook catches judge failure and degrades to its prior fallback while still applying
 every deterministic layer. The notebook writes a baseline submission in its first cell,
-using only 	exttt{pandas} and the required input path, before any asset discovery or
+using only \texttt{pandas} and the required input path, before any asset discovery or
 import; all remaining work runs inside a single exception boundary and a final cell
 asserts the output schema, so the notebook completes with a well-formed submission under
 any downstream failure we tested. Robustness was tested by mutation: shuffled and non-contiguous ids,
@@ -187,7 +191,7 @@ Phase 1 stack (299-only CV, ref.) & 0.770 & 0.88 & 0.72 \\
 Phase 1 full hybrid (private LB) & 0.910 & --- & --- \\
 \bottomrule
 \end{tabular}
-\caption{F1$_0$ on the 299 organizer labels, measured 	extbf{before} the
+\caption{F1$_0$ on the 299 organizer labels, measured \textbf{before} the
 deterministic override layer, i.e.\ for the base ensemble only. The judge receives no
 gradient updates on these rows; the
 1{,}907-row stack row is 5-fold cross-validated over the 299 so no row is scored by a
@@ -247,10 +251,20 @@ optima. Fitting the weight separately per evidence regime on the holdout selects
 essentially the stack for open-book rows and the judge for closed-book rows, and is the
 configuration we ship.
 
+\paragraph{A calibration caveat we did not resolve.} The stack is fitted twice: a
+calibration model on the 1{,}608 pseudo-labeled rows, whose predictions on the 299 are
+honest and set the blend weights and thresholds, and a prediction model additionally
+fitted on the 299 that scores the test rows. Thresholds therefore transfer across two
+probability scales that need not coincide, so the reported figure is not exactly the
+operating point of the shipped predictor. Cross-fitting the 299 would remove this and is
+the first thing we would change with more time.
+
 \paragraph{Other limits.} Arithmetic verification was exact on the recognised Phase 1 template families and is
-not evidence about unseen templates; it fires only on a full structural match and is
-skipped on any parse error, so its risk is a missed override rather than a confident
-wrong one. unparsed math rows fall back to the
+not evidence about unseen templates. Its regexes are not anchored to the full prompt and
+units are unverified, so a false parse would become a confident hard label; we therefore
+restrict it to \emph{canonical} responses (no negation, a single numeric value, at most
+one day name) and skip any row that fails to parse. This narrows but does not eliminate
+the risk, and it is the component we would most want independently stress-tested. unparsed math rows fall back to the
 ensemble, which has learned a strong hallucinated prior for closed-book arithmetic.
 Pseudo-label noise bounds the student from above; we mitigate with cross-judge
 consistency filtering and exact verification where possible, and teacher accuracy was 0.95 on the 41 closed-book rows whose ground truth happened to
