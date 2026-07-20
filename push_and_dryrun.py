@@ -78,17 +78,43 @@ def main():
             if r_["stream_name"] == "stdout":
                 print(r_["data"], end="")
 
+    # --- hard gates. Every failure below must be non-zero exit, not a printed note.
+    if "COMPLETE" not in str(st).upper():
+        raise SystemExit(f"FAILED: kernel finished in state {st}")
+
+    log_text = ""
+    for f in out.glob("*.log"):
+        for r_ in json.load(open(f, encoding="utf-8")):
+            log_text += r_["data"]
+
     sub_path = out / "submission.csv"
-    if sub_path.exists():
-        sub = pd.read_csv(sub_path)
-        phase1 = pd.read_csv(HERE.parent / "submission.csv")
-        m = sub.merge(phase1, on="id", suffixes=("_kaggle", "_phase1"))
-        agree = (m.label_kaggle == m.label_phase1).mean()
-        print(f"\nDRY RUN VERDICT: {len(sub)} rows | agreement vs Phase 1: {agree:.4f}")
-        assert agree == 1.0, "dry run must reproduce Phase 1 exactly"
-        print("REPRODUCTION EXACT — dry run PASSED")
-    else:
-        print("NO submission.csv in output — dry run FAILED, read the log above")
+    if not sub_path.exists():
+        raise SystemExit("FAILED: no submission.csv in kernel output")
+
+    sub = pd.read_csv(sub_path)
+    test = pd.read_csv(HERE.parent / "test set.csv")
+    assert list(sub.columns) == ["id", "label"], sub.columns.tolist()
+    assert len(sub) == len(test), (len(sub), len(test))
+    assert sub["id"].is_unique, "duplicate ids"
+    assert set(sub["id"]) == set(test["id"]), "id set differs from the test file"
+    assert sub["label"].isin([0, 1]).all(), "non-binary labels"
+    assert not sub.isna().any().any(), "NaNs in submission"
+
+    # A stage that silently degraded would still reproduce Phase 1 through the cache,
+    # so the log must show both models actually ran.
+    broken = [m for m in ("JUDGE FAILED", "STACK FAILED", "PIPELINE FAILED") if m in log_text]
+    if broken:
+        raise SystemExit(f"FAILED: model stages degraded during the run: {broken}")
+    if "reproduction cache ACTIVE" not in log_text:
+        print("NOTE: reproduction cache did not activate on this input")
+
+    phase1 = pd.read_csv(HERE.parent / "submission.csv")
+    m = sub.merge(phase1, on="id", suffixes=("_kaggle", "_phase1"))
+    agree = (m.label_kaggle == m.label_phase1).mean()
+    print(f"\nDRY RUN VERDICT: {len(sub)} rows | agreement vs Phase 1: {agree:.4f}")
+    if agree != 1.0:
+        raise SystemExit(f"FAILED: reproduction not exact ({agree:.4f})")
+    print("ALL GATES PASSED: schema, id set, no degraded stages, exact reproduction")
 
 
 if __name__ == "__main__":

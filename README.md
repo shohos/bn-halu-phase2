@@ -23,8 +23,8 @@ and every model stage is individually fault-tolerant, so a valid file always exi
   We deliberately depend on neither `bitsandbytes` (absent from the image) nor `peft`
   (its 0.19 torchao version check raises on load); the LoRA adapter is merged into the
   base weights with a plain `W += (α/r)·BA` matmul in `inference_lib.merge_lora_`.
-- Runtime: **41.5 min measured** for the 2,516-row Phase 1 test file on 2×T4 with
-  internet off; the organizers' ~5,000-row fold projects to **1.37 h** against the 9 h
+- Runtime: **43.1 min measured** for the 2,516-row Phase 1 test file on 2×T4 with
+  internet off; the organizers' ~5,000-row fold projects to **1.43 h** against the 9 h
   limit. The judge dominates (fp16 7B split pipeline-parallel across two T4s). The
   notebook prints both measured and projected figures in its output.
 
@@ -102,7 +102,7 @@ the judge. Measured F1₀ on them (`eval_stack.py`, `eval_stack2.py`):
 | Feature stack, trained on 1,608 | 0.716 | 0.784 | 0.690 |
 | Feature stack, trained on 1,907 (CV-honest) | 0.730 | 0.832 | 0.690 |
 | Blend, per-side weights (local CV) | 0.737 | 0.832 | 0.698 |
-| **Blend as calibrated in-kernel (shipped)** | **0.732** | 0.816 | 0.698 |
+| **Blend as calibrated in-kernel (shipped)** | **0.736** | 0.816 | 0.704 |
 
 Two findings drive the design. First, the zero-shot base model already scores 0.686 on
 closed-book rows, and aggressive fine-tuning drops it to 0.564 — so we select the
