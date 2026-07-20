@@ -16,5 +16,6 @@
   ],
   "model_sources": [
     "qwen-lm/qwen2.5/Transformers/7b-instruct/1"
-  ]
+  ],
+  "machine_shape": "NvidiaTeslaT4"
 }

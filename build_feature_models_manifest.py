@@ -22,9 +22,18 @@ def main():
     for name in required:
         if not (args.root / name / "config.json").is_file():
             raise FileNotFoundError(args.root / name / "config.json")
+    # Kaggle consumes dataset-metadata.json and does not publish it, and never ships
+    # bytecode/OS cruft. Hashing them makes the mount validation fail on files that
+    # cannot be present.
+    skip_names = {"dataset-metadata.json", ".DS_Store"}
+    def excluded(rel):
+        return (rel in skip_names or "__pycache__" in rel or rel.endswith(".pyc"))
     files = {}
     for path in sorted(p for p in args.root.rglob("*") if p.is_file()):
         rel = path.relative_to(args.root).as_posix()
+        if excluded(rel):
+            print("skip", rel)
+            continue
         files[rel] = {"size": path.stat().st_size, "sha256": digest(path)}
         print(rel, files[rel]["sha256"][:12])
     manifest = {"schema_version": 1, "root_contract": required, "files": files}

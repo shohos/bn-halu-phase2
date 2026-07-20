@@ -50,8 +50,20 @@ def validate_notebook(path: Path):
 
 def wait_dataset(api, ref, timeout=1800):
     deadline = time.time() + timeout
+    forbidden = 0
     while time.time() < deadline:
-        state = str(api.dataset_status(ref)).lower()
+        try:
+            state = str(api.dataset_status(ref)).lower()
+        except Exception as e:
+            # brand-new private datasets 403 on the status endpoint for a while even
+            # though processing succeeds; tolerate a run of them, then proceed.
+            forbidden += 1
+            print(f"dataset status not queryable yet ({type(e).__name__}); retry {forbidden}")
+            if forbidden >= 8:
+                print("STAGE:DATASET_READY (status endpoint unavailable; proceeding)")
+                return
+            time.sleep(15)
+            continue
         print("dataset state:", state)
         if state.rsplit(".", 1)[-1] == "ready":
             print("STAGE:DATASET_READY")
@@ -122,6 +134,33 @@ def main():
             result = api.dataset_create_new(str(args.assets), dir_mode="zip")
         print("dataset push:", result)
     wait_dataset(api, args.dataset_ref)
+
+    # Confirm the DEPLOYED asset_manifest matches the notebook's release lock before
+    # pushing the kernel. dataset_status can 403 on a fresh private version and the
+    # kernel would otherwise mount a stale version, tripping the in-notebook lock check.
+    import hashlib
+    import tempfile
+    lock = json.loads((HERE / "r3_release_lock.json").read_text())["asset_manifest_sha256"]
+    for attempt in range(20):
+        try:
+            d = Path(tempfile.mkdtemp())
+            api.dataset_download_file(args.dataset_ref, "asset_manifest.json", path=str(d))
+            hit = next(d.iterdir())
+            if hit.suffix == ".zip":
+                import zipfile
+                zipfile.ZipFile(hit).extractall(d)
+                hit = d / "asset_manifest.json"
+            deployed = hashlib.sha256(hit.read_bytes()).hexdigest()
+            if deployed == lock:
+                print("STAGE:DEPLOYED_MANIFEST_MATCHES_LOCK")
+                break
+            print(f"deployed manifest not yet the expected version "
+                  f"({deployed[:12]} != {lock[:12]}); waiting")
+        except Exception as e:
+            print(f"manifest not fetchable yet ({type(e).__name__}); waiting")
+        time.sleep(20)
+    else:
+        raise RuntimeError("deployed asset manifest never matched the release lock")
 
     print("kernel push:", api.kernels_push(str(args.kernel_dir)))
     wait_kernel(api, args.kernel_ref)
