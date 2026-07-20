@@ -52,10 +52,14 @@ threshold → deterministic overrides.
 
 `bn-halu-assets`:
 - `adapter/` — our LoRA adapter (r=16, α=32) + tokenizer.
-- `corpus.parquet` — the 1,907-row labeled corpus the stack trains on.
+- `corpus_features.parquet` — precomputed **numeric features only** for the 1,907-row
+  labeled corpus, plus labels. We deliberately do not publish the corpus *text*: those
+  rows are Phase 1 competition data, and this dataset is public. Nothing in this dataset
+  reproduces competition content.
 - `thresholds.json` — fallback thresholds (the notebook recalibrates in-kernel).
 - `holdout_probs.json` — judge probabilities on the 299 (for blend calibration).
-- `dataset samples.json` — the organizer-released 299 labeled samples.
+- The organizer-released `dataset samples.json` is read from the competition mount at
+  runtime rather than shipped here, for the same reason.
 - `repro_cache.json` — content-keyed (SHA-256 of context+prompt+response) lookup of our
   Phase 1 predictions. **Disclosure**: it reproduces our Phase 1 submission exactly when
   the notebook is run on the Phase 1 test file (2,516/2,516) and fires on zero rows of
@@ -90,10 +94,18 @@ the judge. Measured F1₀ on them (`eval_stack.py`, `eval_stack2.py`):
 
 | System | F1₀ overall | ctx | no-ctx |
 |---|---|---|---|
-| Distilled judge alone | 0.621 | 0.739 | 0.564 |
-| Feature stack alone (trained on 1,608) | 0.716 | 0.784 | 0.690 |
-| Feature stack (trained on 1,907, CV-honest) | 0.730 | 0.832 | 0.690 |
-| Blend (judge + stack) | 0.731 | 0.830 | 0.690 |
+| Qwen2.5-7B zero-shot judge | 0.699 | 0.737 | 0.686 |
+| + QLoRA 3 epochs @ lr 1e-4 (overfit) | 0.621 | 0.739 | 0.564 |
+| + QLoRA 1 epoch @ lr 4e-5 (**shipped**) | 0.711 | 0.747 | 0.704 |
+| Feature stack, trained on 1,608 | 0.716 | 0.784 | 0.690 |
+| Feature stack, trained on 1,907 (CV-honest) | 0.730 | 0.832 | 0.690 |
+| **Blend, per-side weights (shipped)** | **0.737** | 0.832 | 0.698 |
+
+Two findings drive the design. First, the zero-shot base model already scores 0.686 on
+closed-book rows, and aggressive fine-tuning drops it to 0.564 — so we select the
+checkpoint by per-epoch holdout evaluation (epoch 1 wins; epochs 2-3 degrade
+monotonically). Second, the stack dominates open-book rows while the judge is better on
+closed-book rows, so blend weights are fitted per evidence regime rather than globally.
 
 ## Reproducing our Phase 1 predictions
 

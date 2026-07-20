@@ -478,15 +478,29 @@ def run(test_csv, assets_dir, model_dir=None, out_path="submission.csv",
     t0 = time.time()
     stage = lambda s: print(f"[{time.time() - t0:7.1f}s] {s}", flush=True)
     assets = Path(assets_dir)
-    thresholds = json.loads((assets / "thresholds.json").read_text(encoding="utf-8"))
-    repro = json.loads((assets / "repro_cache.json").read_text(encoding="utf-8"))
-    # Organizer-released sample labels: read from the competition mount rather than
-    # shipping a copy, so our published dataset carries no competition data.
-    samples_path = Path(test_csv).parent / "dataset samples.json"
-    if not samples_path.exists():
-        samples_path = assets / "dataset samples.json"
-    sample_records = json.loads(samples_path.read_text(encoding="utf-8"))
-    stage(f"sample labels from {samples_path}")
+    def load_json(name, default):
+        try:
+            return json.loads((assets / name).read_text(encoding="utf-8"))
+        except Exception as e:
+            stage(f"WARNING: {name} unusable ({type(e).__name__}); using default")
+            return default
+
+    thresholds = load_json("thresholds.json", {"th_ctx": 0.5, "th_noctx": 0.5})
+    repro = load_json("repro_cache.json", {})
+    # Organizer-released sample labels: prefer the competition mount so our published
+    # dataset need not carry competition data. Never fatal — the sample-match override
+    # is one layer among several, and this runs before the fallback file is written.
+    sample_records = []
+    for cand in [Path(test_csv).parent / "dataset samples.json",
+                 assets / "dataset samples.json"]:
+        try:
+            sample_records = json.loads(cand.read_text(encoding="utf-8"))
+            stage(f"sample labels from {cand}")
+            break
+        except Exception:
+            continue
+    if not sample_records:
+        stage("WARNING: no sample labels found; sample-match override disabled")
 
     df = load_frame(test_csv)
     stage(f"loaded {len(df)} rows ({int(df['has_ctx'].sum())} ctx / "
@@ -543,7 +557,7 @@ def run(test_csv, assets_dir, model_dir=None, out_path="submission.csv",
             tr = (meta["split"] == "train").values
             proba_stack, ho = fl.stack_fit_predict(
                 f_corpus[tr], meta.loc[tr, "label"].values, meta.loc[tr, "has_ctx"].values,
-                f_test, f_corpus[~tr])
+                f_test, f_corpus[~tr], y_holdout=meta.loc[~tr, "label"].values)
             stack_holdout = (ho, meta.loc[~tr, "label"].values,
                              meta.loc[~tr, "has_ctx"].values, meta.loc[~tr, "row_id"].values)
             stage("stack trained and applied")
@@ -561,27 +575,39 @@ def run(test_csv, assets_dir, model_dir=None, out_path="submission.csv",
             jp = json.loads((assets / "holdout_probs.json").read_text(encoding="utf-8"))
             ho_judge = np.array([(jp[str(i)]["p_bn"] + jp[str(i)]["p_en"]) / 2
                                  if str(i) in jp else 0.5 for i in ids_ho])
-            if proba_judge is None:
-                w = 0.0
-            best = None
-            for cand in ([0.0] if proba_judge is None else np.arange(0, 1.01, 0.1)):
-                mix = cand * ho_judge + (1 - cand) * ho_stack
-                tc, _ = flat_threshold(y_ho[ctx_ho], mix[ctx_ho])
-                tn, _ = flat_threshold(y_ho[~ctx_ho], mix[~ctx_ho])
-                pred = np.where(ctx_ho, mix >= tc, mix >= tn).astype(int)
-                f1 = f1_class0(y_ho, pred)
-                if best is None or f1 > best[0]:
-                    best = (f1, cand, tc, tn)
-            f1, w, th_c, th_n = best
-            stage(f"blend calibrated on 299: judge weight {w:.1f}, "
-                  f"th ctx {th_c:.2f} / noctx {th_n:.2f} -> holdout F1_0 {f1:.4f}")
+            # Per-side blend weights: with a passage the stack dominates (it can see the
+            # evidence); without one the judge does (it is the only component with world
+            # knowledge). A single global weight averages those two regimes badly.
+            grid = [0.0] if proba_judge is None else [0.0, 0.25, 0.5, 0.75, 1.0]
+            side_w, side_th = {}, {}
+            for name, mask in [("ctx", ctx_ho), ("noctx", ~ctx_ho)]:
+                best = None
+                for cand in grid:
+                    mix = cand * ho_judge[mask] + (1 - cand) * ho_stack[mask]
+                    t, _ = flat_threshold(y_ho[mask], mix)
+                    f1 = f1_class0(y_ho[mask], (mix >= t).astype(int))
+                    if best is None or f1 > best[0]:
+                        best = (f1, cand, t)
+                side_w[name], side_th[name] = best[1], best[2]
+                stage(f"  {name}: judge weight {best[1]:.2f}, th {best[2]:.2f} "
+                      f"-> F1_0 {best[0]:.4f} (n={int(mask.sum())})")
+            w_c, w_n = side_w["ctx"], side_w["noctx"]
+            th_c, th_n = side_th["ctx"], side_th["noctx"]
+            mix_ho = np.where(ctx_ho, w_c * ho_judge + (1 - w_c) * ho_stack,
+                              w_n * ho_judge + (1 - w_n) * ho_stack)
+            pred_ho = np.where(ctx_ho, mix_ho >= th_c, mix_ho >= th_n).astype(int)
+            stage(f"blend calibrated on 299 -> holdout F1_0 {f1_class0(y_ho, pred_ho):.4f}")
+        else:
+            w_c = w_n = 1.0 if proba_stack is None else 0.0
+
+        ctx = df["has_ctx"].values
         if proba_judge is None:
             mix = proba_stack
         elif proba_stack is None:
             mix = proba_judge
         else:
-            mix = w * proba_judge + (1 - w) * proba_stack
-        ctx = df["has_ctx"].values
+            mix = np.where(ctx, w_c * proba_judge + (1 - w_c) * proba_stack,
+                           w_n * proba_judge + (1 - w_n) * proba_stack)
         preds = {idx: int(p >= (th_c if c else th_n))
                  for idx, p, c in zip(df.index, mix, ctx)}
     if preds is None:

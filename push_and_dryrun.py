@@ -59,9 +59,10 @@ def main():
     print("dataset ready; settling 30s"); time.sleep(30)
 
     print("kernel push:", api.kernels_push(str(KERNEL)))
-    for i in range(90):
+    for i in range(400):  # judge on 2xT4 is pipeline-parallel and slow; allow >3 h
         st = str(api.kernels_status("shohos/bn-halu-inference").status)
-        print(f"[{i * 30}s] {st}", flush=True)
+        if i % 10 == 0 or "RUNNING" not in st.upper():
+            print(f"[{i * 30}s] {st}", flush=True)
         if any(k in st.upper() for k in ["COMPLETE", "ERROR", "CANCEL"]):
             break
         time.sleep(30)
