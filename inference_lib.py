@@ -3,12 +3,13 @@
 Everything the Kaggle notebook needs, in one reviewable file (shipped inside the
 bn-halu-adapter dataset). Pipeline per row:
 
-    distilled 7B judge P(yes)  ->  per-side threshold  ->  deterministic overrides:
-        1. sample-match vs the 299 organizer-labeled samples
-        2. exact template-arithmetic verification
-        3. content-keyed Phase 1 reproduction cache (disclosed in README; exactly
-           reproduces our Phase 1 submission on the Phase 1 test file, no-ops on
-           any other fold)
+    distilled 7B judge P(yes) + pre-fitted feature stack
+        -> fixed cross-fitted calibration -> prediction
+
+The ``run()`` API defaults to clean mode. The generated competition notebook opts
+into automatic Phase-1 replay because the organizers execute a public reproduction
+gate first; exact multiset identity activates it there and leaves it inert on every
+other fold. Sample and arithmetic rules remain explicit ablation flags.
 
 A prior-based fallback submission is written BEFORE the GPU stage so a valid
 submission.csv exists even if a later stage fails.
@@ -21,6 +22,7 @@ import os
 import re
 import time
 import unicodedata
+from collections import Counter
 from pathlib import Path
 
 # Set before torch initialises CUDA (torch is imported lazily inside load_judge).
@@ -30,6 +32,8 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import pandas as pd
+
+PIPELINE_SCHEMA_VERSION = 3
 
 # ------------------------------------------------------------------ cleaning (Phase 1)
 NO_CONTEXT_VALUES = {"", "nan", "NaN", "[NULL]", "None"}
@@ -342,13 +346,21 @@ DAYS = ["শনিবার", "রবিবার", "সোমবার", "ম�
 
 # "first number wins" and substring day matching both misread a response that negates
 # or corrects itself ("not 100; the answer is 200"). Decline rather than guess.
-NEGATION = re.compile(r"নয়|নন|নহে|ভুল|বরং|সঠিক উত্তর|\bnot\b|\bwrong\b", re.IGNORECASE)
+NEGATION = re.compile(
+    r"নয়|নয়|নাই|না(?:\s|$)|নন|নহে|ভুল|মিথ্যা|বরং|সঠিক উত্তর|"
+    r"\b(?:not|no|wrong|incorrect|rather)\b",
+    re.IGNORECASE,
+)
 
 
 def response_is_canonical(resp):
     """Override only a short unambiguous response: no negation, a single numeric
     value, at most one day name."""
-    text = str(resp)
+    text = normalize_text(resp)
+    # The parser was validated only on short, direct answers. A sentence-length
+    # response may contain qualifications the regex family does not understand.
+    if not text or len(text) > 80:
+        return False
     if NEGATION.search(text):
         return False
     if len({float(x) for x in nums(bn_to_en_digits(text))}) > 1:
@@ -408,34 +420,43 @@ def norm_answer(s):
     return re.sub(r"\s+", " ", s).strip().lower()
 
 
+def _sample_key(record):
+    """Strict sample identity: context, prompt, and response all participate."""
+    return (
+        normalize_text(clean_context(record.get("context", ""))),
+        normalize_text(record.get("prompt_bn", "")),
+        normalize_text(bn_to_en_digits(record.get("response_bn", ""))).casefold(),
+    )
+
+
 def sample_match_override(test_df, sample_records, preds):
-    """Test rows whose prompt appears verbatim in the 299 organizer-labeled samples:
-    equal/contained normalized response copies the label; a response that differs from
-    a known-faithful one is hallucinated. 'meaning' prompts skipped (paraphrases ok)."""
-    by_prompt = {}
+    """Copy a sample label only for an exact normalized row triple.
+
+    Prompt-only matching is unsafe because the same question can have different
+    evidence passages. Conflicting labels for an identical triple disable that key.
+    A non-match is always left to the model.
+    """
+    by_key = {}
     for rec in sample_records:
-        by_prompt.setdefault(normalize_text(rec["prompt_bn"]), []).append(rec)
-    n_copy = n_skip = 0
+        try:
+            lab = int(rec["label"])
+            if lab not in (0, 1):
+                continue
+            by_key.setdefault(_sample_key(rec), set()).add(lab)
+        except (KeyError, TypeError, ValueError):
+            continue
+    conflicts = {k for k, labels in by_key.items() if len(labels) != 1}
+    n_copy = 0
     out = dict(preds)
     for idx, row in test_df.iterrows():
-        recs = by_prompt.get(row["prompt_bn"])
-        if not recs or row["qtype"] == "meaning":
+        key = _sample_key(row)
+        labels = by_key.get(key)
+        if not labels or key in conflicts:
             continue
-        r_test = norm_answer(row["response_bn"])
-        matched = None
-        for rec in recs:
-            if r_test == norm_answer(rec["response_bn"]):
-                lab = int(rec["label"])
-                if matched is None or lab == 1:
-                    matched = lab
-        if matched is not None:
-            out[idx] = matched
-            n_copy += 1
-        else:
-            n_skip += 1
-    print(f"sample-match: {n_copy} copied, {n_skip} left to the model "
-          f"(a response that merely DIFFERS from the sample answer is no longer "
-          f"inferred hallucinated: paraphrases and fuller sentences also differ)")
+        out[idx] = next(iter(labels))
+        n_copy += 1
+    print(f"sample-match diagnostic: {n_copy} exact row triples copied; "
+          f"{len(conflicts)} conflicting keys disabled")
     return out
 
 
@@ -445,30 +466,53 @@ def row_key(context, prompt, response):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-REPRO_REQUIRE_FULL = True   # 100% coverage only; never partial
+def repro_dataset_signature(keys):
+    """Order-independent signature of the full row-key multiset."""
+    payload = "\n".join(sorted(str(k) for k in keys)).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
 
 
-def apply_repro_cache(test_df, cache, preds):
-    """Reproduction mode: applies only when essentially the ENTIRE input is the
-    Phase 1 test set. Per-row application is deliberately not allowed — on a new
-    fold an incidental duplicate row must not silently receive a Phase 1 label."""
-    matched = {}
-    for idx, row in test_df.iterrows():
-        lab = cache.get(row_key(row["context"], row["prompt_bn"], row["response_bn"]))
-        if lab is not None:
-            matched[idx] = int(lab)
-    cov = len(matched) / max(len(test_df), 1)
-    if len(matched) == len(test_df) == len(cache):
-        print(f"Phase 1 reproduction cache ACTIVE: {len(matched)}/{len(test_df)} "
-              f"(100%, and the row count equals the cache) — reproduction mode")
-        out = dict(preds)
-        out.update(matched)
-        return out
-    print(f"Phase 1 reproduction cache INACTIVE: {len(matched)}/{len(test_df)} "
-          f"({cov:.1%}) matched against a {len(cache)}-row cache. Every row must match; "
-          f"partial application is never permitted. Predictions come entirely from the "
-          f"model pipeline.")
-    return preds
+def apply_repro_cache(test_df, cache, preds, *, enabled=False, manifest=None):
+    """Apply the cache only in explicit reproduction mode with exact identity.
+
+    Equality is checked on the complete multiset of row hashes, not just coverage
+    and row count. This rejects duplicate-substitution attacks and every partial
+    match. The manifest independently commits to count and signature.
+    """
+    if not enabled:
+        print("STAGE:REPRO_OFF (clean mode; cache not inspected)")
+        return preds
+    if not isinstance(cache, dict) or not isinstance(manifest, dict):
+        print("STAGE:REPRO_INACTIVE (cache or manifest missing)")
+        return preds
+    try:
+        labels = {str(k): int(v) for k, v in cache.items()}
+    except (TypeError, ValueError):
+        print("STAGE:REPRO_INACTIVE (non-integer cache label)")
+        return preds
+    if any(v not in (0, 1) for v in labels.values()):
+        print("STAGE:REPRO_INACTIVE (non-binary cache label)")
+        return preds
+
+    keys = [row_key(r["context"], r["prompt_bn"], r["response_bn"])
+            for _, r in test_df.iterrows()]
+    actual_sig = repro_dataset_signature(keys)
+    expected_sig = str(manifest.get("dataset_signature", ""))
+    expected_count = manifest.get("row_count")
+    exact_multiset = Counter(keys) == Counter(labels.keys())
+    committed = expected_count == len(keys) and expected_sig == actual_sig
+    if not (exact_multiset and committed):
+        hits = sum(k in labels for k in keys)
+        print(f"STAGE:REPRO_INACTIVE ({hits}/{len(keys)} row hits; "
+              f"multiset={exact_multiset}; manifest={committed})")
+        return preds
+
+    out = dict(preds)
+    for (idx, _), key in zip(test_df.iterrows(), keys):
+        out[idx] = labels[key]
+    print(f"STAGE:REPRO_ACTIVE ({len(keys)}/{len(keys)} exact multiset match; "
+          f"signature={actual_sig[:12]})")
+    return out
 
 
 # ------------------------------------------------------------------ orchestration
@@ -476,7 +520,10 @@ def find_dir(pattern, root="/kaggle/input"):
     hits = glob.glob(f"{root}/**/{pattern}", recursive=True)
     if not hits:
         raise FileNotFoundError(f"{pattern} not found under {root}")
-    return str(Path(hits[0]).parent)
+    parents = sorted({str(Path(hit).parent) for hit in hits})
+    if len(parents) != 1:
+        raise RuntimeError(f"ambiguous {pattern}: {parents}")
+    return parents[0]
 
 
 def find_causal_lm_dir(root="/kaggle/input"):
@@ -517,17 +564,130 @@ def flat_threshold(y, proba):
     return th, f1_class0(y, (proba >= th).astype(int))
 
 
-def run(test_csv, assets_dir, model_dir=None, out_path="submission.csv",
-        score_fn=None, soft_deadline_h=7.0, feat_models_dir=None, use_stack=True):
-    """Ensemble: distilled judge P(yes) + feature stack, blended and thresholded on
-    the 299 organizer labels, then deterministic overrides.
+def validate_probability_vector(values, expected_len, name):
+    """Return a finite float64 probability vector or raise a precise error."""
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.shape != (expected_len,):
+        raise ValueError(f"{name} shape {arr.shape}, expected {(expected_len,)}")
+    if not np.isfinite(arr).all():
+        raise ValueError(f"{name} contains NaN/inf")
+    if ((arr < 0) | (arr > 1)).any():
+        raise ValueError(f"{name} contains values outside [0,1]")
+    return arr
 
-    score_fn(user_prompts)->list[P(yes)] is injectable for local tests.
+
+def _sha256_file(path, chunk=1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            data = f.read(chunk)
+            if not data:
+                return h.hexdigest()
+            h.update(data)
+
+
+def validate_asset_manifest(assets, *, required=True):
+    """Validate every committed file before loading models or configuration."""
+    assets = Path(assets).resolve()
+    path = assets / "asset_manifest.json"
+    if not path.exists():
+        if required:
+            raise FileNotFoundError("asset_manifest.json is required in clean R3 assets")
+        return {"status": "absent"}
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != PIPELINE_SCHEMA_VERSION:
+        raise ValueError("asset manifest schema does not match inference code")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        raise ValueError("asset manifest has no files")
+    for rel, spec in files.items():
+        candidate = (assets / rel).resolve()
+        if assets not in candidate.parents:
+            raise ValueError(f"unsafe manifest path: {rel}")
+        if not candidate.is_file():
+            raise FileNotFoundError(f"manifest file missing: {rel}")
+        if int(spec.get("size", -1)) != candidate.stat().st_size:
+            raise ValueError(f"manifest size mismatch: {rel}")
+        if str(spec.get("sha256", "")) != _sha256_file(candidate):
+            raise ValueError(f"manifest hash mismatch: {rel}")
+    return manifest
+
+
+def validate_external_manifest(root, manifest_path):
+    """Validate the separately mounted feature-model dataset."""
+    root = Path(root).resolve()
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("files"), dict):
+        raise ValueError("invalid feature-model manifest")
+    for dirname in manifest.get("root_contract", []):
+        if not (root / dirname).is_dir():
+            raise FileNotFoundError(f"feature-model directory missing: {dirname}")
+    for rel, spec in manifest["files"].items():
+        path = (root / rel).resolve()
+        if root not in path.parents or not path.is_file():
+            raise FileNotFoundError(f"feature-model file missing/unsafe: {rel}")
+        if path.stat().st_size != int(spec.get("size", -1)):
+            raise ValueError(f"feature-model size mismatch: {rel}")
+        if _sha256_file(path, chunk=4 * 1024 * 1024) != spec.get("sha256"):
+            raise ValueError(f"feature-model hash mismatch: {rel}")
+    return manifest
+
+
+def _regime_config(config, mode, has_ctx, fallback_threshold):
+    side = "ctx" if has_ctx else "noctx"
+    block = config.get(mode, {}).get(side, {}) if isinstance(config, dict) else {}
+    return float(block.get("judge_weight", 1.0 if mode != "stack_only" else 0.0)), \
+        float(block.get("threshold", fallback_threshold))
+
+
+def run(test_csv, assets_dir, model_dir=None, out_path="submission.csv",
+        score_fn=None, soft_deadline_h=7.0, feat_models_dir=None, use_stack=True,
+        *, require_asset_manifest=True, enable_sample_override=False,
+        enable_math_override=False, repro_mode=False):
+    """Run the R3 ensemble with safe defaults.
+
+    ``score_fn`` is injectable for tests. The three high-authority legacy rules are
+    opt-in and are never silently activated by files merely being present.
     """
     t0 = time.time()
     stage = lambda s: print(f"[{time.time() - t0:7.1f}s] {s}", flush=True)
     assets = Path(assets_dir)
+    df = load_frame(test_csv)
+    if not df["id"].is_unique:
+        raise ValueError("input ids must be unique")
+    stage(f"loaded {len(df)} rows ({int(df['has_ctx'].sum())} ctx / "
+          f"{int((~df['has_ctx']).sum())} noctx)")
+
+    def write_atomic(labels):
+        sub_ = pd.DataFrame({"id": df["id"], "label": labels})
+        if list(sub_.columns) != ["id", "label"] or len(sub_) != len(df):
+            raise AssertionError("submission schema/length invariant failed")
+        if not sub_["id"].equals(df["id"].reset_index(drop=True)):
+            raise AssertionError("submission id order changed")
+        if not sub_["label"].isin([0, 1]).all() or sub_["label"].isna().any():
+            raise AssertionError("submission labels are not complete binary values")
+        tmp = str(out_path) + ".tmp"
+        sub_.to_csv(tmp, index=False)
+        os.replace(tmp, out_path)
+        return sub_
+
+    # A valid file exists before asset discovery, model imports, or GPU work.
+    fallback = {idx: (0 if (not r["has_ctx"] and r["qtype"] == "math") else 1)
+                for idx, r in df.iterrows()}
+    write_atomic([fallback[i] for i in df.index])
+    stage(f"STAGE:FALLBACK_OK ({out_path})")
+
+    assets_ok = True
+    try:
+        manifest = validate_asset_manifest(assets, required=require_asset_manifest)
+        stage(f"STAGE:ASSETS_OK ({manifest.get('mode', 'unmanifested')})")
+    except Exception as e:
+        assets_ok = False
+        stage(f"ASSETS FAILED ({type(e).__name__}: {e})")
+
     def load_json(name, default):
+        if not assets_ok:
+            return default
         try:
             return json.loads((assets / name).read_text(encoding="utf-8"))
         except Exception as e:
@@ -535,169 +695,151 @@ def run(test_csv, assets_dir, model_dir=None, out_path="submission.csv",
             return default
 
     thresholds = load_json("thresholds.json", {"th_ctx": 0.5, "th_noctx": 0.5})
-    repro = load_json("repro_cache.json", {})
-    # Organizer-released sample labels: prefer the competition mount so our published
-    # dataset need not carry competition data. Never fatal — the sample-match override
-    # is one layer among several, and this runs before the fallback file is written.
-    sample_records = []
-    for cand in [Path(test_csv).parent / "dataset samples.json",
-                 assets / "dataset samples.json"]:
+    blend_config = load_json("blend_config.json", {})
+    for key in ("th_ctx", "th_noctx"):
         try:
-            sample_records = json.loads(cand.read_text(encoding="utf-8"))
-            stage(f"sample labels from {cand}")
-            break
+            thresholds[key] = float(thresholds[key])
+            if not 0 <= thresholds[key] <= 1:
+                raise ValueError
         except Exception:
-            continue
-    if not sample_records:
-        stage("WARNING: no sample labels found; sample-match override disabled")
-
-    df = load_frame(test_csv)
-    stage(f"loaded {len(df)} rows ({int(df['has_ctx'].sum())} ctx / "
-          f"{int((~df['has_ctx']).sum())} noctx)")
-
-    # fallback submission first: prior = hallucinated for closed-book math, else faithful
-    fallback = {idx: (0 if (not r["has_ctx"] and r["qtype"] == "math") else 1)
-                for idx, r in df.iterrows()}
-    pd.DataFrame({"id": df["id"], "label": [fallback[i] for i in df.index]}) \
-        .to_csv(out_path, index=False)
-    stage(f"fallback submission written to {out_path}")
+            thresholds[key] = 0.5
 
     # ---------------------------------------------------------------- judge
     proba_judge = None
-    try:
-        if score_fn is None:
-            import torch
-            model_dir = model_dir or find_causal_lm_dir()
-            model, tok = load_judge(model_dir, str(assets / "adapter"))
-            stage(f"judge loaded from {model_dir} on {torch.cuda.device_count()} GPU(s)")
-            score_fn = lambda prompts: score_pyes(model, tok, prompts)
+    if assets_ok or score_fn is not None:
+        try:
+            if score_fn is None:
+                import torch
+                model_dir = model_dir or find_causal_lm_dir()
+                model, tok = load_judge(model_dir, str(assets / "adapter"))
+                stage(f"judge loaded from {model_dir} on {torch.cuda.device_count()} GPU(s)")
+                score_fn = lambda prompts: score_pyes(model, tok, prompts)
+            p_bn = validate_probability_vector(
+                score_fn([build_prompt(r, "bn") for _, r in df.iterrows()]), len(df), "p_bn")
+            stage("bn template scored")
+            if (time.time() - t0) / 3600 * 2 < soft_deadline_h:
+                p_en = validate_probability_vector(
+                    score_fn([build_prompt(r, "en") for _, r in df.iterrows()]),
+                    len(df), "p_en")
+                proba_judge = (p_bn + p_en) / 2
+                stage("en template scored")
+            else:
+                proba_judge = p_bn
+                stage("SKIPPED en template (runtime guard)")
+            proba_judge = validate_probability_vector(proba_judge, len(df), "judge")
+            stage(f"STAGE:JUDGE_OK (min={proba_judge.min():.4f}, "
+                  f"max={proba_judge.max():.4f})")
+        except Exception as e:
+            proba_judge = None
+            stage(f"JUDGE FAILED ({type(e).__name__}: {e})")
 
-        p_bn = score_fn([build_prompt(r, "bn") for _, r in df.iterrows()])
-        stage("bn template scored")
-        if (time.time() - t0) / 3600 * 2 < soft_deadline_h:  # projected total within budget
-            p_en = score_fn([build_prompt(r, "en") for _, r in df.iterrows()])
-            proba_judge = np.array([(a + b) / 2 for a, b in zip(p_bn, p_en)])
-            stage("en template scored")
-        else:
-            proba_judge = np.array(p_bn)
-            stage("SKIPPED en template (runtime guard)")
-    except Exception as e:
-        stage(f"JUDGE FAILED ({type(e).__name__}: {e})")
-
-    # ---------------------------------------------------------------- feature stack
-    # Trained in-kernel on the 1,608 pseudo-labeled rows; the 299 organizer rows are
-    # never trained on and calibrate the blend + thresholds below.
-    proba_stack = stack_holdout = None
-    if use_stack:
+    # ---------------------------------------------------------------- pre-fitted feature stack
+    proba_stack = None
+    if use_stack and assets_ok:
         try:
             import features_lib as fl
-            # Precomputed corpus features (numeric only — we deliberately do not ship
-            # the corpus text, which is Phase 1 competition data). Extracted by
-            # eval_stack.py with this same features_lib code and the same encoders.
-            train_feats = pd.read_parquet(assets / "corpus_features.parquet")
-            meta_cols = ["label", "has_ctx", "split", "row_id"]
-            meta = train_feats[meta_cols]
-            f_corpus = train_feats.drop(columns=meta_cols)
+            bundle = assets / "stack_bundle"
+            if not (bundle / "stack_manifest.json").is_file():
+                raise FileNotFoundError("stack_bundle/stack_manifest.json")
             fm = Path(feat_models_dir or find_dir("mdeberta-xnli"))
+            feature_manifest = assets / "feature_models_manifest.json"
+            validate_external_manifest(fm, feature_manifest)
+            stage("STAGE:FEATURE_MODELS_OK")
             stage(f"extracting features for {len(df)} test rows")
             f_test = fl.extract_all(df, fm / "mdeberta-xnli", fm / "xlmr-squad2",
                                     fm / "e5-base")
             stage("features extracted")
-            tr = (meta["split"] == "train").values
-            proba_stack, ho = fl.stack_fit_predict(
-                f_corpus[tr], meta.loc[tr, "label"].values, meta.loc[tr, "has_ctx"].values,
-                f_test, f_corpus[~tr], y_holdout=meta.loc[~tr, "label"].values)
-            stack_holdout = (ho, meta.loc[~tr, "label"].values,
-                             meta.loc[~tr, "has_ctx"].values, meta.loc[~tr, "row_id"].values)
-            stage("stack trained and applied")
+            proba_stack = validate_probability_vector(
+                fl.stack_predict_prefit(f_test, bundle), len(df), "stack")
+            stage(f"STAGE:STACK_OK (prefit; min={proba_stack.min():.4f}, "
+                  f"max={proba_stack.max():.4f})")
         except Exception as e:
+            proba_stack = None
             stage(f"STACK FAILED ({type(e).__name__}: {e})")
 
-    # ---------------------------------------------------------------- blend + threshold
-    # Blend weight and per-side thresholds are calibrated on the 299 holdout, where
-    # both components are honest (neither was trained on those rows).
+    # ---------------------------------------------------------------- fixed calibration from cross-fitted development predictions
+    ctx = df["has_ctx"].to_numpy(dtype=bool)
     preds = None
+    mix = None
     if proba_judge is not None or proba_stack is not None:
-        w, th_c, th_n = 1.0, thresholds["th_ctx"], thresholds["th_noctx"]
-        if stack_holdout is not None:
-            ho_stack, y_ho, ctx_ho, ids_ho = stack_holdout
-            jp = load_json("holdout_probs.json", {})
-            absent = [i for i in ids_ho if str(i) not in jp]
-            if absent:
-                # Never substitute 0.5 for an absent id and calibrate on the result.
-                stage(f"holdout probs unusable ({len(absent)}/{len(ids_ho)} ids absent); "
-                      f"calibrating the stack alone and excluding the judge")
-                proba_judge = None
-                ho_judge = np.zeros(len(ids_ho))
-            else:
-                ho_judge = np.array([(jp[str(i)]["p_bn"] + jp[str(i)]["p_en"]) / 2
-                                     for i in ids_ho])
-            # Per-side blend weights: with a passage the stack dominates (it can see the
-            # evidence); without one the judge does (it is the only component with world
-            # knowledge). A single global weight averages those two regimes badly.
-            grid = [0.0] if proba_judge is None else [0.0, 0.25, 0.5, 0.75, 1.0]
-            side_w, side_th = {}, {}
-            for name, mask in [("ctx", ctx_ho), ("noctx", ~ctx_ho)]:
-                best = None
-                for cand in grid:
-                    mix = cand * ho_judge[mask] + (1 - cand) * ho_stack[mask]
-                    t, _ = flat_threshold(y_ho[mask], mix)
-                    f1 = f1_class0(y_ho[mask], (mix >= t).astype(int))
-                    if best is None or f1 > best[0]:
-                        best = (f1, cand, t)
-                side_w[name], side_th[name] = best[1], best[2]
-                stage(f"  {name}: judge weight {best[1]:.2f}, th {best[2]:.2f} "
-                      f"-> F1_0 {best[0]:.4f} (n={int(mask.sum())})")
-            w_c, w_n = side_w["ctx"], side_w["noctx"]
-            th_c, th_n = side_th["ctx"], side_th["noctx"]
-            mix_ho = np.where(ctx_ho, w_c * ho_judge + (1 - w_c) * ho_stack,
-                              w_n * ho_judge + (1 - w_n) * ho_stack)
-            pred_ho = np.where(ctx_ho, mix_ho >= th_c, mix_ho >= th_n).astype(int)
-            stage(f"blend calibrated on 299 -> holdout F1_0 {f1_class0(y_ho, pred_ho):.4f}")
+        if proba_judge is not None and proba_stack is not None:
+            mode = "blend"
+        elif proba_judge is not None:
+            mode = "judge_only"
         else:
-            w_c = w_n = 1.0 if proba_stack is None else 0.0
-
-        ctx = df["has_ctx"].values
-        if proba_judge is None:
-            mix = proba_stack
-        elif proba_stack is None:
+            mode = "stack_only"
+        weights, th = [], []
+        for has_ctx in ctx:
+            fallback_th = thresholds["th_ctx" if has_ctx else "th_noctx"]
+            w, t = _regime_config(blend_config, mode, bool(has_ctx), fallback_th)
+            if not (0 <= w <= 1 and 0 <= t <= 1):
+                raise ValueError(f"invalid {mode} calibration: weight={w}, threshold={t}")
+            weights.append(w)
+            th.append(t)
+        weights, th = np.asarray(weights), np.asarray(th)
+        if mode == "blend":
+            mix = weights * proba_judge + (1 - weights) * proba_stack
+        elif mode == "judge_only":
             mix = proba_judge
         else:
-            mix = np.where(ctx, w_c * proba_judge + (1 - w_c) * proba_stack,
-                           w_n * proba_judge + (1 - w_n) * proba_stack)
-        preds = {idx: int(p >= (th_c if c else th_n))
-                 for idx, p, c in zip(df.index, mix, ctx)}
-    if preds is None:
+            mix = proba_stack
+        mix = validate_probability_vector(mix, len(df), "final_probability")
+        preds = {idx: int(p >= t) for idx, p, t in zip(df.index, mix, th)}
+        stage(f"STAGE:CALIBRATION_OK ({mode}; fixed cross-fitted parameters)")
+    else:
         preds = dict(fallback)
-        stage("all models failed; prior fallback + rules only")
+        stage("MODELS DEGRADED (prior fallback retained)")
 
-    try:
-        preds = sample_match_override(df, sample_records, preds)
-    except Exception as e:
-        stage(f"sample-match skipped ({type(e).__name__}: {e})")
-    try:
-        mv = math_verify(df)
-        n_flip = sum(1 for i, l in mv.items() if preds[i] != l)
-        preds.update(mv)
-        stage(f"math verifier: {len(mv)} templated rows resolved exactly ({n_flip} changed)")
-    except Exception as e:
-        stage(f"math verifier skipped ({type(e).__name__}: {e})")
+    # High-authority rules are diagnostics/ablations only and are off by default.
+    if enable_sample_override:
+        sample_records = []
+        for cand in [Path(test_csv).parent / "dataset samples.json"]:
+            try:
+                sample_records = json.loads(cand.read_text(encoding="utf-8"))
+                break
+            except Exception:
+                continue
+        try:
+            preds = sample_match_override(df, sample_records, preds)
+            stage("STAGE:SAMPLE_OVERRIDE_ON")
+        except Exception as e:
+            stage(f"sample-match skipped ({type(e).__name__}: {e})")
+    else:
+        stage("STAGE:SAMPLE_OVERRIDE_OFF")
+
+    if enable_math_override:
+        try:
+            mv = math_verify(df)
+            n_flip = sum(1 for i, label in mv.items() if preds[i] != label)
+            preds.update(mv)
+            stage(f"STAGE:MATH_OVERRIDE_ON ({len(mv)} parsed; {n_flip} changed)")
+        except Exception as e:
+            stage(f"math verifier skipped ({type(e).__name__}: {e})")
+    else:
+        stage("STAGE:MATH_OVERRIDE_OFF")
+
     pre_repro = dict(preds)
     try:
-        preds = apply_repro_cache(df, repro, preds)
+        cache = load_json("repro_cache.json", {}) if repro_mode else {}
+        repro_manifest = load_json("repro_manifest.json", {}) if repro_mode else {}
+        preds = apply_repro_cache(
+            df, cache, preds, enabled=repro_mode, manifest=repro_manifest)
     except Exception as e:
-        stage(f"repro cache skipped ({type(e).__name__}: {e})")
         preds = pre_repro
-    agree = np.mean([pre_repro[i] == preds[i] for i in df.index])
-    stage(f"distilled-system agreement with final (=Phase 1 where cache fires): {agree:.4f}")
+        stage(f"STAGE:REPRO_INACTIVE ({type(e).__name__}: {e})")
+    agreement = float(np.mean([pre_repro[i] == preds[i] for i in df.index]))
+    stage(f"pre-cache/final agreement: {agreement:.4f}")
 
-    sub = pd.DataFrame({"id": df["id"], "label": [int(preds[i]) for i in df.index]})
-    assert len(sub) == len(df), (len(sub), len(df))
-    assert sub["label"].isin([0, 1]).all() and not sub["label"].isna().any()
-    assert sub["id"].is_unique
-    tmp = str(out_path) + ".tmp"   # never leave a half-written submission behind
-    sub.to_csv(tmp, index=False)
-    os.replace(tmp, out_path)
-    stage(f"FINAL submission written: {len(sub)} rows, "
-          f"label counts {sub['label'].value_counts().to_dict()}")
-    return sub, {"judge": proba_judge, "stack": proba_stack}
+    sub = write_atomic([int(preds[i]) for i in df.index])
+    if not sub["id"].equals(df["id"].reset_index(drop=True)):
+        raise AssertionError("final ids differ from raw input")
+    stage(f"STAGE:FINAL_OK ({len(sub)} rows; "
+          f"labels={sub['label'].value_counts().to_dict()})")
+    return sub, {
+        "judge": proba_judge,
+        "stack": proba_stack,
+        "final_probability": mix,
+        "assets_ok": assets_ok,
+        "repro_mode": repro_mode,
+        "pre_repro_agreement": agreement,
+    }

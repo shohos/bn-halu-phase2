@@ -13,3 +13,22 @@ AUDIT_RESPONSE.md
 AUDIT_RESPONSE_R2.md
 BENGALI_HALLUCINATION_PHASE2_AUDIT.md
 AUDIT_RESPONSE_VERIFIED_REVIEW.md
+
+# R3 build artifacts and private assets — MUST NOT be published
+build/
+backup_r2_*/
+upload_bn_halu_assets_r3/
+r3_release_lock.json
+project_fixed_r3/
+AUDIT_RESPONSE_R3.md
+
+# private data files, banned by name (belt-and-suspenders over upload_*/ and data/)
+repro_cache.json
+repro_manifest.json
+corpus_features.parquet
+corpus.parquet
+holdout_probs.json
+stack_oof_audit.json
+dataset samples.json
+feats_corpus.parquet
+bn_halu_adapter.zip

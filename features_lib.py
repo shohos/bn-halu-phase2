@@ -3,10 +3,14 @@
 Features: lexical/overlap, e5 embedding cosines (plain transformers, mean pooling),
 mDeBERTa-XNLI entailment (context rows), XLM-R-SQuAD2 extractive-QA agreement
 (context rows). Stack: XGBoost + standardized LogisticRegression, 50/50 blend,
-Phase 1 hyperparameters, trained in-kernel on shipped features for the 1,907
-labeled rows, with the distilled judge's P(yes) as two extra features.
+Phase 1 hyperparameters. R3 loads a pre-fitted portable stack bundle at inference;
+labeled corpus features are used only by the offline bundle builder and are not
+published with the Kaggle assets.
 """
+import hashlib
+import json
 import os
+from pathlib import Path
 
 # transformers pulls in TF for some image utils; on a machine with a numpy-1.x-built
 # TF that import explodes. Harmless on Kaggle, required locally (same as Phase 1).
@@ -236,54 +240,130 @@ def add_judge_cols(feats, df, p_bn, p_en):
     return out
 
 
-def make_models():
+def make_models(params=None):
     from sklearn.linear_model import LogisticRegression
     from xgboost import XGBClassifier
-    xgb = XGBClassifier(n_estimators=300, max_depth=3, learning_rate=0.06,
-                        subsample=0.9, colsample_bytree=0.8, reg_lambda=2.0,
-                        min_child_weight=3, eval_metric="logloss",
-                        random_state=42, n_jobs=4)
+    cfg = {
+        "n_estimators": 300, "max_depth": 3, "learning_rate": 0.06,
+        "subsample": 0.9, "colsample_bytree": 0.8, "reg_lambda": 2.0,
+        "min_child_weight": 3,
+    }
+    cfg.update(params or {})
+    xgb = XGBClassifier(**cfg, eval_metric="logloss", random_state=42, n_jobs=4)
     lr = LogisticRegression(max_iter=2000, C=0.3, class_weight="balanced",
                             random_state=42)
     return xgb, lr
 
 
-def _fit(X, y):
+def fit_stack_models(X, y, params=None):
     from sklearn.preprocessing import StandardScaler
-    xgb, lr = make_models()
+    xgb, lr = make_models(params)
     xgb.fit(X, y)
     sc = StandardScaler().fit(X)
     lr.fit(sc.transform(X), y)
-    return lambda Z: 0.5 * xgb.predict_proba(Z)[:, 1] + \
-        0.5 * lr.predict_proba(sc.transform(Z))[:, 1]
+    return xgb, lr, sc
+
+
+def predict_stack_models(models, X, xgb_weight=0.5):
+    xgb, lr, sc = models
+    return xgb_weight * xgb.predict_proba(X)[:, 1] + \
+        (1 - xgb_weight) * lr.predict_proba(sc.transform(X))[:, 1]
+
+
+def _feature_matrix(frame, columns):
+    if len(columns) != len(set(columns)):
+        raise ValueError("stack manifest contains duplicate feature columns")
+    missing = [c for c in columns if c not in frame.columns]
+    if missing:
+        raise ValueError(f"missing stack features: {missing}")
+    matrix = frame.loc[:, columns].to_numpy(dtype=np.float32)
+    if matrix.ndim != 2 or matrix.shape[1] != len(columns):
+        raise ValueError("invalid feature matrix shape")
+    if not np.isfinite(matrix).all():
+        raise ValueError("feature matrix contains NaN/inf")
+    return matrix
+
+
+def save_stack_bundle(models, columns, bundle_dir, *, xgb_weight=0.5, metadata=None):
+    """Save XGBoost JSON plus minimal NumPy parameters for logistic inference."""
+    xgb, lr, sc = models
+    bundle = Path(bundle_dir)
+    bundle.mkdir(parents=True, exist_ok=True)
+    xgb.get_booster().save_model(str(bundle / "xgb_model.json"))
+    np.savez_compressed(
+        bundle / "lr_model.npz",
+        mean=np.asarray(sc.mean_, dtype=np.float64),
+        scale=np.asarray(sc.scale_, dtype=np.float64),
+        coef=np.asarray(lr.coef_[0], dtype=np.float64),
+        intercept=np.asarray([lr.intercept_[0]], dtype=np.float64),
+    )
+    manifest = {
+        "schema_version": 1,
+        "feature_columns": list(columns),
+        "xgb_weight": float(xgb_weight),
+        "lr_weight": float(1 - xgb_weight),
+        "metadata": metadata or {},
+    }
+    (bundle / "stack_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def stack_predict_prefit(X_new, bundle_dir):
+    """Predict with a pre-fitted bundle; never reads labels or fits in-kernel."""
+    bundle = Path(bundle_dir)
+    manifest = json.loads((bundle / "stack_manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1:
+        raise ValueError("unsupported stack bundle schema")
+    expected_code = manifest.get("metadata", {}).get("features_lib_sha256")
+    if expected_code:
+        actual_code = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        if actual_code != expected_code:
+            raise ValueError("features_lib.py differs from the bundle-building version")
+    columns = manifest.get("feature_columns")
+    if not isinstance(columns, list) or not columns:
+        raise ValueError("stack bundle has no feature column contract")
+    X = _feature_matrix(X_new, columns)
+    wx = float(manifest.get("xgb_weight", 0.5))
+    wl = float(manifest.get("lr_weight", 1 - wx))
+    if wx < 0 or wl < 0 or not np.isclose(wx + wl, 1.0):
+        raise ValueError("invalid stack component weights")
+
+    p = np.zeros(len(X), dtype=np.float64)
+    if wx:
+        import xgboost as xgb
+        booster = xgb.Booster()
+        booster.load_model(str(bundle / "xgb_model.json"))
+        p += wx * booster.predict(xgb.DMatrix(X))
+    if wl:
+        with np.load(bundle / "lr_model.npz", allow_pickle=False) as z:
+            mean = np.asarray(z["mean"], dtype=np.float64)
+            scale = np.asarray(z["scale"], dtype=np.float64)
+            coef = np.asarray(z["coef"], dtype=np.float64)
+            intercept = float(np.asarray(z["intercept"], dtype=np.float64).reshape(-1)[0])
+        if any(v.shape != (len(columns),) for v in (mean, scale, coef)):
+            raise ValueError("logistic bundle dimensions do not match feature contract")
+        scale = np.where(scale == 0, 1.0, scale)
+        logits = ((X.astype(np.float64) - mean) / scale) @ coef + intercept
+        logits = np.clip(logits, -60, 60)
+        p += wl / (1 + np.exp(-logits))
+    if not np.isfinite(p).all() or ((p < 0) | (p > 1)).any():
+        raise ValueError("prefit stack produced invalid probabilities")
+    return p
 
 
 def stack_fit_predict(X_train, y_train, ctx_train, X_new, X_holdout, y_holdout=None):
-    """Two fits, deliberately:
+    """Compatibility helper using one model scale for holdout and test.
 
-    - calibration model: trained on the pseudo-labeled rows only, so its predictions
-      on the 299 organizer rows are honest and can calibrate blend weights/thresholds.
-    - prediction model: additionally trained on those 299 (the cleanest labels we
-      have), used for the actual test rows. Measured +0.014 F1_0 over the 1,608-only
-      model in cross-validation.
-
-    Returns (test probabilities, honest holdout probabilities).
+    For final assets use ``build_stack_bundle.py``, which produces five-fold OOF
+    development probabilities and a separately fitted final model. This helper
+    intentionally trains only on ``X_train`` so calibration and test probabilities
+    cannot silently cross model scales.
     """
     cols = X_train.columns
     Xt = X_train.values.astype(np.float32)
     Xn = X_new[cols].values.astype(np.float32)
     Xh = X_holdout[cols].values.astype(np.float32)
 
-    calib = _fit(Xt, y_train)
-    ho_proba = calib(Xh)
-
-    if y_holdout is not None:
-        Xfull = np.vstack([Xt, Xh])
-        yfull = np.concatenate([y_train, y_holdout])
-        final = _fit(Xfull, yfull)
-        print(f"stack: calibration fit on {len(y_train)}, prediction fit on {len(yfull)}")
-    else:
-        final = calib
-        print(f"stack: single fit on {len(y_train)}")
-
-    return final(Xn), ho_proba
+    model = fit_stack_models(Xt, y_train)
+    print(f"stack compatibility path: single fit on {len(y_train)}")
+    return predict_stack_models(model, Xn), predict_stack_models(model, Xh)

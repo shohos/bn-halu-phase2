@@ -1,0 +1,20 @@
+{
+  "id": "shohos/bn-halu-inference",
+  "title": "bn-halu-inference",
+  "code_file": "kaggle_inference.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "dataset_sources": [
+    "shohos/bn-halu-assets-r3-private",
+    "shohos/bn-halu-featmodels"
+  ],
+  "competition_sources": [
+    "bengali-hallucination"
+  ],
+  "model_sources": [
+    "qwen-lm/qwen2.5/Transformers/7b-instruct/1"
+  ]
+}

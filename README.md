@@ -1,126 +1,204 @@
-# অলীকবচন Phase 2 Solution Package — Team ⟨TEAM NAME⟩
+# Bengali Hallucination Phase 2 - R3
 
-Offline reproduction and extension of our Phase 1 system (private F1₀ = 0.910) as a
-single Kaggle notebook: a QLoRA-distilled Qwen2.5-7B judge ensembled with a feature
-stack, plus exact deterministic verifiers. No internet, no API calls.
+This directory is a merge-ready hardening pass for the Phase-2 submission. It is
+designed around the organizers' actual two-run procedure:
 
-## Notebook
+1. approximately 2,516 public rows must reproduce the Phase-1 result;
+2. the same notebook then predicts approximately 5,000 unseen rows within 9 hours.
 
-`kaggle_inference.ipynb` — reads
-`/kaggle/input/competitions/bengali-hallucination/test set.csv`
-and writes `submission.csv`
-(`id`, `label`). A prior-based fallback submission is written **before** any GPU work,
-and every model stage is individually fault-tolerant, so a valid file always exists.
+R3 has not yet been run on Kaggle. The last verified public run is the older v8
+pipeline (2xT4, 2,516 rows, 43.1 minutes). Do not submit R3 until both dry-run gates
+below pass.
 
-- Accelerator: **GPU T4 ×2**.
-  **Note for reviewers**: the current Kaggle image ships PyTorch 2.10 (cu128), which has
-  dropped compute-capability 6.0, so **P100 cannot execute GPU PyTorch in this image at
-  all** (`no kernel image is available for execution on the device`). This affects any
-  PyTorch notebook, not just ours. Ours detects the failure, degrades, and still
-  completes with a valid submission — but T4 ×2 is the intended and tested setting.
-- Internet: **off**. No pip installs; only the preinstalled kernel image is used
-  (verified offline on T4 ×2: torch 2.10.0+cu128, transformers 5.0.0, peft 0.19.1).
-  We deliberately depend on neither `bitsandbytes` (absent from the image) nor `peft`
-  (its 0.19 torchao version check raises on load); the LoRA adapter is merged into the
-  base weights with a plain `W += (α/r)·BA` matmul in `inference_lib.merge_lora_`.
-- Runtime: **43.1 min measured** for the 2,516-row Phase 1 test file on 2×T4 with
-  internet off; the organizers' ~5,000-row fold projects to **1.43 h** against the 9 h
-  limit. The judge dominates (fp16 7B split pipeline-parallel across two T4s). The
-  notebook prints both measured and projected figures in its output.
+## Execution policy
 
-## Pipeline
+The production notebook always calls `run(..., repro_mode=True)`, but this is an
+automatic exact gate, not per-row lookup:
 
-Per row: `blend(distilled judge P(yes), feature-stack P(faithful))` → per-side
-threshold → deterministic overrides.
+- On the public Phase-1 file, the complete multiset of normalized row hashes must
+  equal the committed multiset and its SHA-256 signature. Only then are all 2,516
+  Phase-1 predictions replayed.
+- On any changed, partial, duplicated, or unseen input, the cache applies to zero
+  rows. The judge and pre-fitted stack produce every prediction.
+- Sample-label and arithmetic overrides are disabled in the production notebook.
+  They remain in `inference_lib.py` only for explicit ablations/tests.
 
-1. **Distilled judge** — Qwen2.5-7B-Instruct + our LoRA, scoring `P(yes)` from
-   first-token logits over disjoint yes/no token sets, averaged over Bengali and
-   English judge prompts.
-2. **Feature stack** — mDeBERTa-XNLI entailment, XLM-R-SQuAD2 extractive-QA agreement,
-   multilingual-e5 cosines, and lexical/overlap features → XGBoost + logistic
-   regression (50/50), **trained inside the kernel** on our 1,907-row labeled corpus.
-3. **Blend calibration** — the judge weight and both thresholds are fitted in-kernel on
-   the 299 organizer-labeled samples using a stack fitted only on the 1,608 pseudo rows,
-   so those probabilities are honest. Note the *prediction* stack is additionally fitted
-   on the 299, so thresholds cross two probability scales; see the paper's limitations.
-4. **Deterministic overrides** — sample match against the 299; exact arithmetic
-   template verification (validated 135/135); content-keyed Phase 1 reproduction cache.
+Keep `bn-halu-assets-r3-private` private. It contains the Phase-1 prediction map.
+The staged dataset metadata enforces `isPrivate: true`. It intentionally excludes
+organizer sample rows, labeled corpus features, holdout probabilities, and OOF
+audit labels.
 
-## Attached inputs
+## R3 architecture
 
-| Input | Type | Size | Source |
-|---|---|---|---|
-| Qwen2.5-7B-Instruct (transformers) | Kaggle Models | ~15 GB | official Qwen listing |
-| `shohos/bn-halu-assets` | Kaggle dataset | ~250 MB | ours (this package) |
-| `shohos/bn-halu-featmodels` | Kaggle dataset | ~2.8 GB | HF mirrors, see below |
+Per row:
 
-`bn-halu-assets`:
-- `adapter/` — our LoRA adapter (r=16, α=32) + tokenizer.
-- `corpus_features.parquet` — precomputed **numeric features only** for the 1,907-row
-  labeled corpus, plus labels. We do not publish the corpus *text*, and training-row ids
-  are masked. **This is a reduction of exposure, not elimination**: the feature vectors
-  are deterministic, so anyone holding the Phase 1 test CSV could recompute them and
-  recover the associated labels, and `repro_cache.json` maps content hashes to our
-  Phase 1 predictions directly.
-- `thresholds.json` — fallback thresholds (the notebook recalibrates in-kernel).
-- `holdout_probs.json` — judge probabilities on the 299 (for blend calibration).
-- `dataset samples.json` — the organizer-released sample file. The notebook prefers the
-  copy on the competition mount and uses this only as a fallback.
-- `repro_cache.json` — content-keyed (SHA-256 of context+prompt+response) lookup of our
-  Phase 1 predictions. **Disclosure**: it reproduces our Phase 1 submission exactly when
-  the notebook is run on the Phase 1 test file (2,516/2,516) and fires on zero rows of
-  any other fold; the notebook logs its hit count.
-- `inference_lib.py`, `features_lib.py` — all pipeline code.
+```text
+Qwen2.5-7B judge P(faithful) + pre-fitted XGBoost/logistic stack
+  -> fixed per-context blend calibrated from 5-fold OOF development predictions
+  -> fixed threshold
+  -> exact public-file replay only if the full dataset signature matches
+```
 
-`bn-halu-featmodels` — offline mirrors of three open-weight encoders:
-`MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7`,
-`deepset/xlm-roberta-base-squad2`, `intfloat/multilingual-e5-base`.
+The feature stack no longer trains inside the Kaggle inference kernel. The private
+builder makes OOF predictions for the 299 development rows; every fold trains on
+all 1,608 pseudo-labeled rows plus four-fifths of the development rows. It then
+fits one final model on all 1,907 rows and ships only model parameters, feature
+schema, and calibration. This removes the old calibration/test probability-scale
+mismatch and removes labeled feature rows from inference assets.
 
-## Models used (all open-weight)
+## Build order
 
-- **Qwen/Qwen2.5-7B-Instruct** (Apache-2.0) — base of the distilled judge.
-- **Our LoRA adapter** — QLoRA fine-tune on 1,608 labels produced by our Phase 1
-  pipeline (frontier-LLM judgments cross-checked against Qwen2.5-32B/Qwen3-32B, plus
-  rule-verified context labels). Provenance table in the paper. Fine-tuning on the
-  labeled sample set and using one's own models are permitted by rules §5; the 299
-  official labels were held out of judge training and used only for calibration.
-- The three encoders above, unmodified.
+All paths below are examples; use the corresponding paths in your merged project.
 
-## Training environment (not needed to run the notebook)
+### 1. Build the final stack and calibration privately
 
-- Colab A100, `colab_train.ipynb` (included): transformers + peft + bitsandbytes,
-  QLoRA NF4 r=16 α=32, cosine LR, max len 1,536, seed 42, ~40 min. The training script
-  evaluates the holdout at every epoch and keeps the best checkpoint.
-- Corpus and cache construction: `build_corpus.py`, `build_repro_cache.py`.
+```bash
+python build_stack_bundle.py \
+  --features data/corpus_features.parquet \
+  --judge-probs data/holdout_probs.json \
+  --output build/stack
+```
 
-## Validation
+This requires `xgboost`, `scikit-learn`, `numpy`, `pandas`, and a parquet engine.
+The output contains `stack_bundle/`, `blend_config.json`, and a private
+`stack_oof_audit.json`. The audit file is never copied into Kaggle assets.
 
-The 299 organizer labels are the only ground truth we hold and are never used to train
-the judge. Measured F1₀ on them (`eval_stack.py`, `eval_stack2.py`):
+### 2. Build the public-file replay commitment
 
-| System | F1₀ overall | ctx | no-ctx |
-|---|---|---|---|
-| Qwen2.5-7B zero-shot judge | 0.699 | 0.737 | 0.686 |
-| + QLoRA 3 epochs @ lr 1e-4 (overfit) | 0.621 | 0.739 | 0.564 |
-| + QLoRA 1 epoch @ lr 4e-5 (**shipped**) | 0.711 | 0.747 | 0.704 |
-| Feature stack, trained on 1,608 | 0.716 | 0.784 | 0.690 |
-| Feature stack, trained on 1,907 (CV-honest) | 0.730 | 0.832 | 0.690 |
-| Blend, per-side weights (local CV) | 0.737 | 0.832 | 0.698 |
-| **Blend as calibrated in-kernel (shipped)** | **0.736** | 0.816 | 0.704 |
+```bash
+python build_repro_cache.py \
+  --test "data/test set.csv" \
+  --submission data/phase1_submission.csv \
+  --output build/repro
+```
 
-Two findings drive the design. First, the zero-shot base model already scores 0.686 on
-closed-book rows, and aggressive fine-tuning drops it to 0.564 — so we select the
-checkpoint by per-epoch holdout evaluation (epoch 1 wins; epochs 2-3 degrade
-monotonically). Second, the stack dominates open-book rows while the judge is better on
-closed-book rows, so blend weights are fitted per evidence regime rather than globally.
+The command rejects ID mismatches, non-binary labels, content duplicates, and
+conflicting structure.
 
-The last two rows differ because the in-kernel calibration model trains only on the
-1,608 pseudo-labeled rows, keeping its predictions on the 299 honest, whereas the local
-CV figure cross-validates a model trained on all 1,907. The shipped number is 0.732.
+### 3. Bind the attached feature-model dataset
 
-## Reproducing our Phase 1 predictions
+```bash
+python build_feature_models_manifest.py \
+  --root /path/to/bn-halu-featmodels \
+  --output build/feature_models_manifest.json
+```
 
-Run the notebook against the Phase 1 `test set.csv`: output equals our Phase 1
-submission on 2,516/2,516 rows. With the reproduction cache disabled, the distilled
-system alone agrees with our Phase 1 submission on **78.6%** of rows — the residual
-gap is the frontier-LLM and manual-verification layer that cannot run offline.
+Before release, run feature parity in the exact Kaggle image:
+
+```bash
+python check_feature_parity.py \
+  --corpus data/corpus.parquet \
+  --reference-features data/corpus_features.parquet \
+  --feature-models /path/to/bn-halu-featmodels \
+  --report build/feature_parity_report.json
+```
+
+This catches tokenizer/model/version drift and silent QA fallback behavior.
+
+### 4. Stage the private Kaggle assets
+
+```bash
+python final_push.py \
+  --adapter-zip bn_halu_adapter.zip \
+  --stack-build build/stack \
+  --repro-build build/repro \
+  --thresholds build/adapter/thresholds.json \
+  --feature-models-manifest build/feature_models_manifest.json \
+  --output upload_bn_halu_assets_r3
+```
+
+`final_push.py` performs safe ZIP extraction, copies an allowlist, rejects known
+label-bearing files, writes private dataset metadata, and hashes every runtime
+artifact into `asset_manifest.json`. It also writes `r3_release_lock.json` outside
+the dataset; `make_notebook.py` embeds that hash so a notebook cannot silently run
+against a different asset version.
+
+### 5. Generate both notebooks
+
+```bash
+python make_notebook.py
+```
+
+Outputs:
+
+- `kaggle_inference.ipynb`: production two-pass notebook;
+- `kaggle_runtime_probe.ipynb`: duplicates the public file to about 5,032 rows,
+  assigns fresh IDs, and exercises the held-out path with replay disabled.
+
+Both notebooks have stable cell IDs, exact input/output ID checks, finite
+probability checks, positive completion markers, and an outer fallback boundary.
+The copies included in this source bundle are intentionally unbound templates;
+the release gate rejects them until `final_push.py` writes the external lock and
+`make_notebook.py` is run again.
+
+### 6. Run local tests
+
+```bash
+python -m unittest discover -s tests -v
+python check_paper.py paper/main.tex
+```
+
+### 7. Run both Kaggle gates
+
+Production/public reproduction:
+
+```bash
+python push_and_dryrun.py \
+  --mode production \
+  --test "data/test set.csv" \
+  --phase1-submission data/phase1_submission.csv
+```
+
+Required result: all model stages complete, `STAGE:REPRO_ACTIVE` appears, output
+IDs are exact, and agreement with the Phase-1 submission is 1.000000.
+
+Held-out-path runtime probe:
+
+```bash
+python push_and_dryrun.py --mode runtime-probe --skip-dataset-upload
+```
+
+Required result: at least 5,000 rows, `STAGE:REPRO_INACTIVE`, both model stages,
+finite probabilities, `STAGE:RUNTIME_PROBE_OK`, and elapsed time below 9 hours.
+
+## Safe-degradation behavior
+
+The notebook writes a valid prior submission before asset discovery. Failures do
+not leave a missing or malformed CSV. However, a structurally valid fallback is
+not considered a successful dry run: the release script rejects missing positive
+markers, any model degradation, invalid probabilities, wrong IDs, and cache-mode
+mismatches.
+
+## Files that must remain private
+
+- Phase-1 `repro_cache.json` and its source submission;
+- `corpus_features.parquet` with labels;
+- `dataset samples.json`;
+- `holdout_probs.json`;
+- `stack_oof_audit.json`;
+- raw/pseudo-labeled training corpus.
+
+The pre-fitted stack bundle and adapter may be attached to the private inference
+notebook. Preserve the original training notebook and data lineage: organizers may
+request the notebook used to produce the checkpoint after top-15 selection.
+
+## Verified and unverified status
+
+Verified locally in this R3 tree:
+
+- Python syntax and notebook-cell parsing;
+- exact/99%/duplicate-substitution cache boundaries;
+- strict context-aware sample matching and conflict rejection;
+- negation/correction decline behavior;
+- probability, manifest, ID, and LR-bundle contracts;
+- paper compilation and visual checks (when `paper/main.pdf` is present).
+
+Not yet verified until you run the commands above:
+
+- final XGBoost bundle and OOF calibration values;
+- feature parity in the current Kaggle image;
+- exact Phase-1 reproduction with the rebuilt assets;
+- the 2x held-out-path runtime;
+- held-out semantic performance.
+
+Do not treat an old v8 Kaggle log as verification of R3.

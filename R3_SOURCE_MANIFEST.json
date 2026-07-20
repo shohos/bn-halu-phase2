@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "bundle": "BENGALI_HALLUCINATION_R3_MERGE_BUNDLE.zip",
+  "note": "Source-only R3 bundle; generated notebooks are unbound templates.",
+  "files": {
+    "AUDIT_RESPONSE_R3.md": {
+      "size": 11206,
+      "sha256": "4f5fd45aeb6e6f0ef051056f969a0f477ce545f89f7b2e3cf97191b54b7e86c5"
+    },
+    "R3_MERGE_INSTRUCTIONS.md": {
+      "size": 4731,
+      "sha256": "0ba40ea583c1b481b65d8db9fd3e6c9f0a5b6d4c7c79ddca5267068bbd889981"
+    },
+    "README.md": {
+      "size": 7195,
+      "sha256": "748c62af66541d3706aa2708a0790249fe1335b059a71387168d78af2d261439"
+    },
+    "TRAINING_REPRODUCIBILITY.md": {
+      "size": 1373,
+      "sha256": "a5bc88eb2c9550d9725f1b2598f13e72834c6590520163daf7bd1c93dfac6164"
+    },
+    "build_feature_models_manifest.py": {
+      "size": 1351,
+      "sha256": "319f25cbca5c0198684034f6838557178d896017a232e279a572079348836c34"
+    },
+    "build_repro_cache.py": {
+      "size": 2493,
+      "sha256": "85aeef386f12e9042e7f4185fa8eed09afd00b81bc41f1a35fabcc5b76459ce6"
+    },
+    "build_stack_bundle.py": {
+      "size": 8649,
+      "sha256": "ef38c603038cae58436a52409c13d1703ebac9e8e9f94e05d6b4dea4fb8f5ebc"
+    },
+    "build_training_manifest.py": {
+      "size": 1980,
+      "sha256": "d72b0d9baa6231ab3441151d7f42dbaabede9c7b46cfe0975b0d5fdb7e36ab76"
+    },
+    "check_feature_parity.py": {
+      "size": 2737,
+      "sha256": "a601ece2d6519563cf52714a737e5581010ab8d51c8b30684b77430ff16f15b5"
+    },
+    "check_paper.py": {
+      "size": 3708,
+      "sha256": "7a46dea9f8c643c73f8e2604da66440be0b85e1fe438d2f451d5ff00123e3008"
+    },
+    "colab_train_original.ipynb": {
+      "size": 13517,
+      "sha256": "e3e62d03d16f3cb039a265a099b2b24e59633d45beccc676f9c04b818a7736cc"
+    },
+    "features_lib.py": {
+      "size": 16186,
+      "sha256": "5754d972e893a48c6d6d91523251d84142ecf0bd8cdd33f24e02a57326544393"
+    },
+    "final_push.py": {
+      "size": 6474,
+      "sha256": "7df53f5c5b20ba26732bcd16b12afc3360bd04b97f638b346d8dedf31b1ab892"
+    },
+    "inference_lib.py": {
+      "size": 37708,
+      "sha256": "97ab236e3b2b662e718cf6085bb1cd0da09771816e7734b0dd6d8f2d26a35123"
+    },
+    "kaggle_inference.ipynb": {
+      "size": 4602,
+      "sha256": "75cfe4d6b3fe187477c8fd9571b88e0a67dec2e9d60bcaada17e8cbed3fe5ba3"
+    },
+    "kaggle_runtime_probe.ipynb": {
+      "size": 4896,
+      "sha256": "3feb2f1091c1d17144ea95471be855d35f8eb04a51fa97185743861bedaec98c"
+    },
+    "kernel_inference/kaggle_inference.ipynb": {
+      "size": 4602,
+      "sha256": "75cfe4d6b3fe187477c8fd9571b88e0a67dec2e9d60bcaada17e8cbed3fe5ba3"
+    },
+    "kernel_inference/kernel-metadata.json": {
+      "size": 472,
+      "sha256": "4dc4ccc0391963674f7bbdae1f2906a9d40c9a03a695ba4d1e4caa235346268f"
+    },
+    "kernel_runtime_probe/kaggle_runtime_probe.ipynb": {
+      "size": 4896,
+      "sha256": "3feb2f1091c1d17144ea95471be855d35f8eb04a51fa97185743861bedaec98c"
+    },
+    "kernel_runtime_probe/kernel-metadata.json": {
+      "size": 484,
+      "sha256": "9fe12b07bf05a495505b86c22393d349ca285a587f10284e11f7c99f12748c6e"
+    },
+    "make_notebook.py": {
+      "size": 7108,
+      "sha256": "58094aeb8a4ed4fc8f7fed6eb31944a82600343e4bcd9f7968eee67d8cc8f332"
+    },
+    "output/pdf/Bengali_Hallucination_R3_Paper.pdf": {
+      "size": 154048,
+      "sha256": "047b7b393e17df9b16db0d60cfcb86d59670e1acc9ce0ea2fbf6e8065126da6a"
+    },
+    "package_r3.py": {
+      "size": 1999,
+      "sha256": "844e920a6a082712cb1535cd0def26c912858c6eb6ccaf8af92789f27d23d200"
+    },
+    "paper/acl.sty": {
+      "size": 11615,
+      "sha256": "19dfeddc2c0e448f3926a0bef048a9db3f3611b46265b760caabd7ada4f361de"
+    },
+    "paper/main.pdf": {
+      "size": 154048,
+      "sha256": "047b7b393e17df9b16db0d60cfcb86d59670e1acc9ce0ea2fbf6e8065126da6a"
+    },
+    "paper/main.tex": {
+      "size": 13456,
+      "sha256": "bc1f59687ac642141a9cffc6db59cc811859f3ffbbef7d7c8fd367f9a1e38c6a"
+    },
+    "push_and_dryrun.py": {
+      "size": 7568,
+      "sha256": "66a635e42a11a72e68f4bc00fda16f99822f0592217be86ffbaaa632bd802efd"
+    },
+    "tests/test_r3.py": {
+      "size": 9268,
+      "sha256": "4064a9e4535b9aa347544045b2907d856cb0857085873258a091e7e23ed60e8f"
+    }
+  }
+}

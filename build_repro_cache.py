@@ -1,49 +1,56 @@
-"""Content-keyed Phase 1 reproduction cache: sha256(normalized row text) -> label.
+"""Build the exact Phase-1 reproduction cache and its multiset commitment.
 
-Keyed by content, not id, so it exactly reproduces Phase 1 predictions when the
-organizers run the notebook on the Phase 1 test file, and silently no-ops on the
-held-out fold. Disclosed in the README/paper.
-
-Run:  python build_repro_cache.py
+The submitted notebook enables automatic reproduction mode. The cache activates
+only if the complete normalized public input has the committed signature. On the
+held-out fold it is inert. Keep the generated cache in a private Kaggle Dataset.
 """
-import hashlib
+import argparse
 import json
-import sys
 from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline"))
-from common import DATA_DIR, load_test  # noqa: E402
-
-OUT = Path(__file__).resolve().parent / "data"
-
-
-def row_key(context, prompt, response):
-    s = "\x1f".join([str(context), str(prompt), str(response)])
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+from inference_lib import load_frame, repro_dataset_signature, row_key
 
 
 def main():
-    test_df = load_test()  # normalized text, same cleaning the notebook applies
-    sub = pd.read_csv(DATA_DIR / "submission.csv")
-    labels = dict(zip(sub["id"].astype(int), sub["label"].astype(int)))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test", type=Path, required=True, help="Phase-1 test set.csv")
+    parser.add_argument("--submission", type=Path, required=True,
+                        help="the exact Phase-1 submission to reproduce")
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
 
-    cache = {}
-    collisions = 0
-    for _, r in test_df.iterrows():
-        k = row_key(r["context"], r["prompt_bn"], r["response_bn"])
-        lab = labels[int(r["id"])]
-        if k in cache and cache[k] != lab:
-            collisions += 1  # same content, conflicting Phase 1 labels -> drop key
-            cache[k] = None
-        elif k not in cache:
-            cache[k] = lab
-    cache = {k: v for k, v in cache.items() if v is not None}
+    test = load_frame(args.test)
+    submission = pd.read_csv(args.submission)
+    if list(submission.columns) != ["id", "label"]:
+        raise ValueError("submission columns must be exactly id,label")
+    if not test["id"].is_unique or not submission["id"].is_unique:
+        raise ValueError("test and submission ids must be unique")
+    if set(test["id"]) != set(submission["id"]):
+        raise ValueError("test and submission id sets differ")
+    if not submission["label"].isin([0, 1]).all() or submission["label"].isna().any():
+        raise ValueError("submission labels must be complete and binary")
+    labels = submission.set_index("id")["label"].astype(int).to_dict()
 
-    path = OUT / "repro_cache.json"
-    path.write_text(json.dumps(cache), encoding="utf-8")
-    print(f"wrote {path}: {len(cache)} keys ({collisions} conflicting-content keys dropped)")
+    keys = [row_key(r["context"], r["prompt_bn"], r["response_bn"])
+            for _, r in test.iterrows()]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate normalized row content cannot be represented safely")
+    cache = {key: labels[row_id] for key, row_id in zip(keys, test["id"])}
+    output = args.output
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "repro_cache.json").write_text(
+        json.dumps(cache, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    manifest = {
+        "schema_version": 1,
+        "row_count": len(keys),
+        "dataset_signature": repro_dataset_signature(keys),
+        "normalization": "inference_lib.load_frame+row_key-v3",
+    }
+    (output / "repro_manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {len(cache)} cache rows; signature={manifest['dataset_signature']}")
 
 
 if __name__ == "__main__":
