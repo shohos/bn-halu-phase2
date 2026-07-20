@@ -148,9 +148,15 @@ def qa_features(df, model_dir, batch_size=16):
         from transformers import pipeline as hf_pipeline
         qa = hf_pipeline("question-answering", model=model_dir, device=0,
                          batch_size=batch_size, torch_dtype=torch.float16)
-        inputs = [{"question": p, "context": c}
-                  for p, c in zip(sub["prompt_bn"], sub["context"])]
-        outputs = qa(inputs, max_answer_len=64, handle_impossible_answer=False)
+        qs = sub["prompt_bn"].tolist()
+        cs = sub["context"].tolist()
+        # transformers v5 made __call__ keyword-only; v4 accepted a list of dicts.
+        try:
+            outputs = qa(question=qs, context=cs, max_answer_len=64,
+                         handle_impossible_answer=False)
+        except TypeError:
+            outputs = qa([{"question": q, "context": c} for q, c in zip(qs, cs)],
+                         max_answer_len=64, handle_impossible_answer=False)
         if isinstance(outputs, dict):
             outputs = [outputs]
         char_sims, tok_ovs, ans_in, resp_in, scores = [], [], [], [], []

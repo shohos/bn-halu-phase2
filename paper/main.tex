@@ -138,12 +138,13 @@ system produces every prediction. The notebook logs its hit count.
 
 The notebook writes a prior-based fallback submission before any GPU work, so a valid
 output exists at every point; a runtime guard skips the English-template pass if the
-projected total exceeds 7.5 h (at 2{,}516 rows the full system needs $<$1 h on
-2$\times$T4). We found during dry runs that the current Kaggle image (PyTorch 2.10,
-cu128) no longer supports the P100's compute capability 6.0, so GPU execution on P100
-fails for \emph{any} PyTorch model; our notebook catches judge failure and degrades to
-its prior fallback while still applying every deterministic layer, guaranteeing a valid
-submission on either accelerator. Robustness was tested by mutation: shuffled and non-contiguous ids,
+projected total exceeds 7.5 h. Measured on 2$\times$T4 over the 2{,}516-row Phase 1
+test file, the full pipeline runs well inside the limit, and the organizers' 5{,}000-row
+held-out fold projects to roughly an hour against a 9 h budget. We found during dry runs
+that the current Kaggle image (PyTorch 2.10, cu128) no longer supports the P100's
+compute capability 6.0, so GPU execution on P100 fails for \emph{any} PyTorch model; our
+notebook catches judge failure and degrades to its prior fallback while still applying
+every deterministic layer, guaranteeing a valid submission on either accelerator. Robustness was tested by mutation: shuffled and non-contiguous ids,
 varying row counts, all three no-context encodings (NaN, \texttt{[NULL]}, empty),
 numeric responses, quoted newlines, and reordered or missing columns.
 
@@ -187,16 +188,48 @@ by count ($n=166$) and is where closed-book world knowledge matters most.
 
 \section{Analysis and Limitations}
 
-The distillation transfers the frontier layer's judgment patterns but also its
-knowledge gaps: closed-book Bangladesh-specific facts that the teacher verified via
-live web search are now answered from the student's parametric knowledge alone. The
-deterministic arithmetic layer is immune to fold shift only insofar as the template
-families recur; unparsed math rows fall back to the judge, which learned a strong
-hallucinated prior for closed-book math. Label noise in the pseudo-labels bounds the
-student: we mitigated with cross-judge consistency filtering and exact verification
-where possible, and we quantify teacher quality at 0.95 accuracy on the 41 closed-book
-rows with derivable ground truth. Finally, thresholds are calibrated on 299 rows; we
-deliberately chose flat-region medians over argmax values to reduce variance.
+\paragraph{What does not distil.} Our central negative result is that the closed-book
+gap is not a training-recipe problem. Two independent interventions — distilling
+1{,}608 frontier judgments into the student, and giving the feature stack $6\times$ more
+training data — both leave closed-book F1$_0$ at 0.69, while open-book F1$_0$ moves from
+0.784 to 0.832. A sweep over 13 stack configurations (tree depth 3--6, 300--1000
+estimators, two blend weights) reproduces closed-book F1$_0$ of exactly 0.6899 in twelve
+of them, so the ceiling is not model capacity either. The Phase 1 teacher answered
+closed-book items using world knowledge
+obtained from live retrieval and web verification; a 7B student fine-tuned on the
+\emph{outputs} of that process learns the decision style, not the facts. Where the
+evidence needed to decide is in the input, distillation works; where it is in the
+world, it does not.
+
+\paragraph{Overfitting the judge.} Our first fine-tune (lr $10^{-4}$, 3 epochs) drove
+training loss to 0.002 and scored only 0.621 on the holdout — memorisation of 1{,}608
+rows rather than a transferable decision rule. We reduced the learning rate, raised
+dropout, and select the checkpoint by per-epoch holdout evaluation rather than taking
+the final epoch.
+
+\paragraph{Other limits.} The deterministic arithmetic layer is immune to fold shift
+only insofar as its template families recur; unparsed math rows fall back to the
+ensemble, which has learned a strong hallucinated prior for closed-book arithmetic.
+Pseudo-label noise bounds the student from above; we mitigate with cross-judge
+consistency filtering and exact verification where possible, and we measure teacher
+quality at 0.95 accuracy on the 41 closed-book rows whose ground truth is derivable.
+Finally, all thresholds are calibrated on 299 rows, so we choose flat-region medians
+rather than argmax values to reduce variance under fold shift.
+
+\paragraph{Engineering findings for offline kernels.} Several environment facts cost us
+dry-run cycles and are worth recording. The current Kaggle image (PyTorch 2.10, cu128)
+no longer supports the P100's compute capability 6.0, so GPU PyTorch cannot run on that
+accelerator at all. \texttt{bitsandbytes} is absent from the image, ruling out 4-bit
+inference without a vendored wheel. \texttt{peft}~0.19 raises on a \texttt{torchao}
+version check when attaching an adapter, so we merge LoRA weights directly
+($W \mathrel{+}= (\alpha/r)BA$) and drop the dependency. Locating the base model by
+globbing for \texttt{model*.safetensors} silently finds the wrong network once encoder
+mirrors are also attached, so we match on \texttt{config.json} architecture instead.
+Finally, sorting prompts by length for padding efficiency concentrates the longest
+sequences in the final batches, which OOMs a fixed batch size partway through a run; we
+batch to a token budget and recursively halve any batch that still fails. Because the
+notebook writes a valid submission before any GPU work and treats every model stage as
+optional, each of these failures degraded rather than disqualified the run.
 
 \section{Compliance and Reproducibility}
 

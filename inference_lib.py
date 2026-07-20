@@ -17,10 +17,16 @@ import glob
 import hashlib
 import json
 import math
+import os
 import re
 import time
 import unicodedata
 from pathlib import Path
+
+# Set before torch initialises CUDA (torch is imported lazily inside load_judge).
+# The 7B judge's activation buffers fragment the T4s badly at long sequence lengths.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import pandas as pd
@@ -163,31 +169,74 @@ def load_judge(model_dir, adapter_dir):
     return model, tok
 
 
-def score_pyes(model, tok, user_prompts, batch_size=16, max_len=1536, log_every=20):
-    """Batched 1-token P(yes), length-sorted for throughput, original order returned."""
+def score_pyes(model, tok, user_prompts, max_len=1536, token_budget=12288,
+               max_batch=16, log_every=20):
+    """Batched 1-token P(yes), original order returned.
+
+    Batches are built to a *token* budget rather than a fixed row count: prompts are
+    length-sorted for padding efficiency, which puts the longest ones last, and a
+    fixed batch size OOMs there. Any batch that still OOMs is split and retried.
+    """
     import torch
 
     yes_ids, no_ids = first_token_ids(tok, ["Yes", "হ্যাঁ"], ["No", "না"])
-    chats = [tok.apply_chat_template([{"role": "user", "content": u}],
-                                     tokenize=False, add_generation_prompt=True)
-             for u in user_prompts]
-    order = sorted(range(len(chats)), key=lambda i: len(chats[i]))
-    out = [0.5] * len(chats)
-    tok.padding_side = "left"
     tok.truncation_side = "left"  # keep the question+answer tail, drop passage head
-    with torch.no_grad():
-        for b, i in enumerate(range(0, len(order), batch_size)):
-            idx = order[i:i + batch_size]
-            enc = tok([chats[j] for j in idx], return_tensors="pt", padding=True,
-                      truncation=True, max_length=max_len).to(model.device)
-            logits = model(**enc).logits[:, -1, :].float()
-            probs = torch.softmax(logits, dim=-1)
-            p_yes = probs[:, yes_ids].sum(-1)
-            p_no = probs[:, no_ids].sum(-1)
-            for j, v in zip(idx, (p_yes / (p_yes + p_no + 1e-9)).cpu().tolist()):
-                out[j] = v
-            if log_every and b % log_every == 0:
-                print(f"  batch {b}/{(len(order) + batch_size - 1) // batch_size}", flush=True)
+    tok.padding_side = "left"
+
+    ids = [tok(tok.apply_chat_template([{"role": "user", "content": u}], tokenize=False,
+                                       add_generation_prompt=True),
+               add_special_tokens=False, truncation=True, max_length=max_len)["input_ids"]
+           for u in user_prompts]
+    order = sorted(range(len(ids)), key=lambda i: len(ids[i]))
+
+    batches, cur = [], []
+    for i in order:
+        trial = cur + [i]
+        if cur and (len(trial) * len(ids[trial[-1]]) > token_budget or len(trial) > max_batch):
+            batches.append(cur)
+            cur = [i]
+        else:
+            cur = trial
+    if cur:
+        batches.append(cur)
+
+    out = [0.5] * len(ids)
+    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+
+    def run(idx):
+        n = max(len(ids[j]) for j in idx)
+        inp = torch.full((len(idx), n), pad, dtype=torch.long)
+        att = torch.zeros((len(idx), n), dtype=torch.long)
+        for r, j in enumerate(idx):  # left padding
+            L = len(ids[j])
+            inp[r, n - L:] = torch.tensor(ids[j])
+            att[r, n - L:] = 1
+        inp, att = inp.to(model.device), att.to(model.device)
+        with torch.no_grad():
+            logits = model(input_ids=inp, attention_mask=att).logits[:, -1, :].float()
+        probs = torch.softmax(logits, dim=-1)
+        p_yes = probs[:, yes_ids].sum(-1)
+        p_no = probs[:, no_ids].sum(-1)
+        for j, v in zip(idx, (p_yes / (p_yes + p_no + 1e-9)).cpu().tolist()):
+            out[j] = v
+
+    def run_safe(idx):
+        try:
+            run(idx)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if len(idx) == 1:
+                print(f"  OOM on a single row (len {len(ids[idx[0]])}); leaving at 0.5",
+                      flush=True)
+                return
+            h = len(idx) // 2
+            run_safe(idx[:h])
+            run_safe(idx[h:])
+
+    for b, idx in enumerate(batches):
+        run_safe(idx)
+        if log_every and b % log_every == 0:
+            print(f"  batch {b}/{len(batches)}", flush=True)
     return out
 
 
@@ -384,6 +433,24 @@ def find_dir(pattern, root="/kaggle/input"):
     return str(Path(hits[0]).parent)
 
 
+def find_causal_lm_dir(root="/kaggle/input"):
+    """Directory of the Qwen judge. Must check config.json: the feature-model dataset
+    also ships model.safetensors files, and a bare glob picks XLM-R first."""
+    cands = []
+    for cfg in glob.glob(f"{root}/**/config.json", recursive=True):
+        try:
+            c = json.loads(Path(cfg).read_text())
+        except Exception:
+            continue
+        arch = " ".join(c.get("architectures") or []) + " " + str(c.get("model_type", ""))
+        if "qwen" in arch.lower() and "ForCausalLM" in arch:
+            if glob.glob(str(Path(cfg).parent / "*.safetensors")):
+                cands.append(str(Path(cfg).parent))
+    if not cands:
+        raise FileNotFoundError(f"no Qwen causal-LM directory under {root}")
+    return sorted(cands)[0]
+
+
 def f1_class0(y, pred):
     y, pred = np.asarray(y), np.asarray(pred)
     tp = int(((y == 0) & (pred == 0)).sum())
@@ -413,7 +480,13 @@ def run(test_csv, assets_dir, model_dir=None, out_path="submission.csv",
     assets = Path(assets_dir)
     thresholds = json.loads((assets / "thresholds.json").read_text(encoding="utf-8"))
     repro = json.loads((assets / "repro_cache.json").read_text(encoding="utf-8"))
-    sample_records = json.loads((assets / "dataset samples.json").read_text(encoding="utf-8"))
+    # Organizer-released sample labels: read from the competition mount rather than
+    # shipping a copy, so our published dataset carries no competition data.
+    samples_path = Path(test_csv).parent / "dataset samples.json"
+    if not samples_path.exists():
+        samples_path = assets / "dataset samples.json"
+    sample_records = json.loads(samples_path.read_text(encoding="utf-8"))
+    stage(f"sample labels from {samples_path}")
 
     df = load_frame(test_csv)
     stage(f"loaded {len(df)} rows ({int(df['has_ctx'].sum())} ctx / "
@@ -431,7 +504,7 @@ def run(test_csv, assets_dir, model_dir=None, out_path="submission.csv",
     try:
         if score_fn is None:
             import torch
-            model_dir = model_dir or find_dir("model*.safetensors")  # not adapter_model.safetensors
+            model_dir = model_dir or find_causal_lm_dir()
             model, tok = load_judge(model_dir, str(assets / "adapter"))
             stage(f"judge loaded from {model_dir} on {torch.cuda.device_count()} GPU(s)")
             score_fn = lambda prompts: score_pyes(model, tok, prompts)
