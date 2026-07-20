@@ -30,11 +30,14 @@ Phase 2 we convert that pipeline into a self-contained offline system: the front
 judging layer is distilled into a QLoRA fine-tune of Qwen2.5-7B-Instruct trained on
 1,608 labels the Phase 1 system produced, ensembled with a feature stack that now
 trains on 6$\times$ the labeled data Phase 1 had, under a layer of exact deterministic
-verifiers. We report an honest ablation on the 299 organizer-labeled samples — the only
-ground truth we hold, and which the judge never sees: the distilled judge alone reaches
-F1$_0$ = 0.621 while the data-scaled stack reaches 0.730, quantifying how much of the
-Phase 1 score rested on world knowledge a 7B student cannot absorb from judgments
-alone. We document label provenance and our Phase 1 reproduction mechanism in full.
+verifiers. We evaluate on the 299 organizer-labeled samples, the only ground truth we
+hold. These rows receive no gradient updates, but they drive checkpoint selection,
+threshold calibration and system development, so we report them as a
+\emph{development set} rather than an untouched holdout. The shipped judge reaches
+F1$_0$ = 0.711 there and the data-scaled stack 0.730, combining to 0.732 before
+deterministic overrides. An aggressive first fine-tune scored only 0.621, \emph{below}
+the 0.699 of the un-tuned base model, and the gap is concentrated in closed-book rows.
+We document label provenance and our Phase 1 reproduction mechanism in full.
 \end{abstract}
 
 \section{Task and Setting}
@@ -71,9 +74,16 @@ in an offline kernel, which motivates the Phase 2 design.
 
 Rather than approximating each online component separately, we treat the \emph{outputs}
 of the Phase 1 pipeline as a teacher signal and distill them into one open-weight
-student: a judge that answers ``is this response correct?'' directly. The offline
-system is then: distilled judge probability $\rightarrow$ per-side threshold
-$\rightarrow$ deterministic overrides.
+student: a judge that answers ``is this response correct?'' directly. That judge is then
+ensembled with the Phase 1 feature stack, retrained on the enlarged corpus. The offline
+system is
+\[
+\text{judge } P(\text{yes}) \;+\; \text{stack } P(\text{faithful})
+\rightarrow \text{regime blend} \rightarrow \text{regime threshold}
+\rightarrow \text{overrides,}
+\]
+with blend weights and thresholds fitted separately for the open- and closed-book
+regimes, because the two components dominate in opposite regimes (\S5).
 
 \subsection{Training corpus and label provenance}
 
@@ -92,8 +102,8 @@ Verified ctx & 485 & 251/234 & mixed$^{b}$ \\
 cross-checked against two open 32B judges; templated-arithmetic subset verified
 exactly by our solver (135/135). $^{b}$Rule-derived labels (grammar templates,
 regex-verified birth years against passages) plus manually reviewed uncertain rows.
-The 299 official samples are \textbf{never trained on}; they are our only
-model-selection holdout. Disclosure: a minority of the verified-ctx and frontier
+The 299 official samples receive \textbf{no gradient updates} but are used for model
+selection and calibration, so we treat them as a development set. Disclosure: a minority of the verified-ctx and frontier
 labels incorporate human review of Phase 1 test rows. Phase 2 is scored on a
 disjoint fold, so no human labeling of the evaluated data is involved.}
 \label{tab:provenance}
@@ -109,14 +119,15 @@ Phase 1 judge prompts), giving 3{,}216 examples.
 \subsection{Distilled judge}
 
 We fine-tune Qwen2.5-7B-Instruct with QLoRA (NF4, $r{=}16$, $\alpha{=}32$, dropout
-0.05, all linear projections; lr $10^{-4}$ cosine; 3 epochs; max length 1{,}536;
+0.1, all linear projections; lr $4{\cdot}10^{-5}$ cosine; max length 1{,}536; three
+epochs scheduled with the \emph{first} selected by development-set evaluation;
 loss on the answer tokens only). The model is trained to answer
 the Bengali words for yes/no (\emph{hyam}/\emph{na}) or English Yes/No. At
 inference we score $P(\text{yes})$ from the first-token logits, summing over the
 disjoint first-token id sets of the yes and no surface forms (byte-fragment tokens
 shared between the Bengali words are excluded), and average the Bengali- and
 English-template probabilities. Thresholds on $P(\text{yes})$ are chosen per side
-(open-/closed-book) on the 299-sample holdout, taking the \emph{median of the
+(open-/closed-book) on the 299-sample development set, taking the \emph{median of the
 threshold region} within 0.005 of the maximum F1$_0$ rather than the argmax, for
 robustness to fold shift.
 
@@ -124,14 +135,16 @@ robustness to fold shift.
 
 Three exact, content-based overrides run after the judge (increasing authority):
 (1) \textbf{sample match}: a test row whose prompt appears verbatim among the 299
-labeled samples is resolved by normalized-answer matching against the known
-faithful/hallucinated responses; (2) \textbf{arithmetic verification}: 14 regex
+labeled samples is resolved by \emph{exact} normalized-answer equality against the
+known faithful/hallucinated responses (we removed substring containment, which could
+mark a contradictory response containing the correct span as faithful); (2) \textbf{arithmetic verification}: 14 regex
 template families parse the digit-normalized prompt, compute the true answer, and
 label by numeric match (validated 135/135 against derivable Phase 1 truth);
 (3) \textbf{Phase 1 reproduction cache}: a SHA-256 content-keyed (context, prompt,
 response) lookup of our Phase 1 predictions. On the Phase 1 test file this reproduces
-our Phase 1 submission exactly (2{,}516/2{,}516 rows); on the held-out fold, which by
-the rules shares no rows with Phase 1 test, it fires on zero rows and the distilled
+our Phase 1 submission exactly (2{,}516/2{,}516 rows). It is all-or-nothing: it applies
+only when at least 99\% of the input rows match, so an incidental duplicate on a new
+fold cannot receive a Phase 1 label. Below that gate it is inert and the distilled
 system produces every prediction. The notebook logs its hit count.
 
 \subsection{Engineering for the offline kernel}
@@ -144,7 +157,11 @@ held-out fold projects to roughly an hour against a 9 h budget. We found during 
 that the current Kaggle image (PyTorch 2.10, cu128) no longer supports the P100's
 compute capability 6.0, so GPU execution on P100 fails for \emph{any} PyTorch model; our
 notebook catches judge failure and degrades to its prior fallback while still applying
-every deterministic layer, guaranteeing a valid submission on either accelerator. Robustness was tested by mutation: shuffled and non-contiguous ids,
+every deterministic layer. The notebook writes a baseline submission in its first cell,
+using only 	exttt{pandas} and the required input path, before any asset discovery or
+import; all remaining work runs inside a single exception boundary and a final cell
+asserts the output schema, so the notebook completes with a well-formed submission under
+any downstream failure we tested. Robustness was tested by mutation: shuffled and non-contiguous ids,
 varying row counts, all three no-context encodings (NaN, \texttt{[NULL]}, empty),
 numeric responses, quoted newlines, and reordered or missing columns.
 
@@ -170,7 +187,9 @@ Phase 1 stack (299-only CV, ref.) & 0.770 & 0.88 & 0.72 \\
 Phase 1 full hybrid (private LB) & 0.910 & --- & --- \\
 \bottomrule
 \end{tabular}
-\caption{F1$_0$ on the 299 organizer labels. The judge never trains on them; the
+\caption{F1$_0$ on the 299 organizer labels, measured 	extbf{before} the
+deterministic override layer, i.e.\ for the base ensemble only. The judge receives no
+gradient updates on these rows; the
 1{,}907-row stack row is 5-fold cross-validated over the 299 so no row is scored by a
 model that saw it. Phase 1 rows are reference points, measured differently (CV on the
 299 alone, and the private leaderboard).}
@@ -196,7 +215,8 @@ by count ($n=166$) and is where closed-book world knowledge matters most.
 \paragraph{What does not distil.} Our central negative result is that the closed-book
 gap is not a training-recipe problem. Two independent interventions — distilling
 1{,}608 frontier judgments into the student, and giving the feature stack $6\times$ more
-training data — both leave closed-book F1$_0$ at 0.69, while open-book F1$_0$ moves from
+training data — both leave closed-book F1$_0$ at 0.69 \emph{on this development set},
+while open-book F1$_0$ moves from
 0.784 to 0.832. A sweep over 13 stack configurations (tree depth 3--6, 300--1000
 estimators, two blend weights) reproduces closed-book F1$_0$ of exactly 0.6899 in twelve
 of them, so the ceiling is not model capacity either. The Phase 1 teacher answered
@@ -207,7 +227,9 @@ evidence needed to decide is in the input, distillation works; where it is in th
 world, it does not.
 
 \paragraph{Fine-tuning can destroy what it cannot replace.} Table~\ref{tab:results}
-contains our most useful diagnostic: the \emph{zero-shot} base model already scores
+contains our most useful diagnostic, though we note up front that a 299-row
+development set and a single 7B student cannot establish general claims about
+distillation. Under the recipes we evaluated: the \emph{zero-shot} base model already scores
 0.686 on closed-book rows. Our first fine-tune (lr $10^{-4}$, 3 epochs, training loss
 0.002) drove that \emph{down} to 0.564 — distillation on judgments the student cannot
 justify from the input does not merely fail to add knowledge, it overwrites calibrated
@@ -225,12 +247,14 @@ optima. Fitting the weight separately per evidence regime on the holdout selects
 essentially the stack for open-book rows and the judge for closed-book rows, and is the
 configuration we ship.
 
-\paragraph{Other limits.} The deterministic arithmetic layer is immune to fold shift
-only insofar as its template families recur; unparsed math rows fall back to the
+\paragraph{Other limits.} Arithmetic verification was exact on the recognised Phase 1 template families and is
+not evidence about unseen templates; it fires only on a full structural match and is
+skipped on any parse error, so its risk is a missed override rather than a confident
+wrong one. unparsed math rows fall back to the
 ensemble, which has learned a strong hallucinated prior for closed-book arithmetic.
 Pseudo-label noise bounds the student from above; we mitigate with cross-judge
-consistency filtering and exact verification where possible, and we measure teacher
-quality at 0.95 accuracy on the 41 closed-book rows whose ground truth is derivable.
+consistency filtering and exact verification where possible, and teacher accuracy was 0.95 on the 41 closed-book rows whose ground truth happened to
+be derivable, a selected subset that need not represent the teacher overall.
 Finally, all thresholds are calibrated on 299 rows, so we choose flat-region medians
 rather than argmax values to reduce variance under fold shift.
 
@@ -253,15 +277,31 @@ optional, each of these failures degraded rather than disqualified the run.
 
 All inference-time models are open-weight (Qwen2.5-7B-Instruct base + our LoRA
 adapter; both attached as Kaggle datasets/models), no internet access is required, and
-total weights are $\approx$16\,GB. Fine-tuning on the labeled sample set and own
+total weights are $\approx$18\,GB (15.2\,GB base, 0.15\,GB adapter, 2.8\,GB encoders). Fine-tuning on the labeled sample set and own
 models are explicitly permitted by the competition rules; we additionally disclose all
 label provenance in Table~\ref{tab:provenance} and the reproduction-cache mechanism in
 \S3.4. The README lists the exact environment and artifacts.
 
 \section*{Acknowledgments}
-⟨Optional.⟩
+We thank the organizers for the dataset and for the Phase 2 infrastructure.
 
-\bibliography{custom}
-\bibliographystyle{acl_natbib}
+\begin{thebibliography}{9}
+\bibitem{qwen25} A.~Yang et al. Qwen2.5 Technical Report. \emph{arXiv:2412.15115}, 2024.
+\bibitem{qlora} T.~Dettmers, A.~Pagnoni, A.~Holtzman, L.~Zettlemoyer. QLoRA: Efficient
+Finetuning of Quantized LLMs. \emph{NeurIPS}, 2023.
+\bibitem{lora} E.~Hu et al. LoRA: Low-Rank Adaptation of Large Language Models.
+\emph{ICLR}, 2022.
+\bibitem{distill} G.~Hinton, O.~Vinyals, J.~Dean. Distilling the Knowledge in a Neural
+Network. \emph{arXiv:1503.02531}, 2015.
+\bibitem{e5} L.~Wang et al. Multilingual E5 Text Embeddings. \emph{arXiv:2402.05672}, 2024.
+\bibitem{xgboost} T.~Chen, C.~Guestrin. XGBoost: A Scalable Tree Boosting System.
+\emph{KDD}, 2016.
+\bibitem{xnli} A.~Conneau et al. XNLI: Evaluating Cross-lingual Sentence
+Representations. \emph{EMNLP}, 2018.
+\bibitem{xlmr} A.~Conneau et al. Unsupervised Cross-lingual Representation Learning at
+Scale. \emph{ACL}, 2020.
+\bibitem{halu} Y.~Zhang et al. Siren's Song in the AI Ocean: A Survey on Hallucination
+in Large Language Models. \emph{arXiv:2309.01219}, 2023.
+\end{thebibliography}
 
 \end{document}

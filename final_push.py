@@ -12,6 +12,7 @@ import sys
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 HERE = Path(__file__).resolve().parent
@@ -38,7 +39,10 @@ def rebuild_assets(zip_path=None):
     feats["label"] = corpus["label"].values
     feats["has_ctx"] = corpus["has_ctx"].values
     feats["split"] = corpus["split"].values
-    feats["row_id"] = corpus["id"].values
+    # Publish row_id ONLY for the 299 organizer rows (needed to key holdout_probs).
+    # Training rows are Phase 1 test rows: their ids + our labels would let anyone
+    # join a derived answer key back onto the public test set.
+    feats["row_id"] = np.where(corpus["split"].values == "holdout", corpus["id"].values, -1)
     feats.to_parquet(ASSETS / "corpus_features.parquet", index=False)
     (ASSETS / "corpus.parquet").unlink(missing_ok=True)
     for f in ["inference_lib.py", "features_lib.py"]:
